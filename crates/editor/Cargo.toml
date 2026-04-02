@@ -1,0 +1,10 @@
+[package]
+name = "larknotes-editor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+larknotes-core = { path = "../core" }
+tracing = { workspace = true }
+which = "7"
+dirs = { workspace = true }

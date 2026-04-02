@@ -1,0 +1,40 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/main/nicegui/json_schemas/tauri.conf.json",
+  "identifier": "com.larknotes.app",
+  "productName": "LarkNotes",
+  "version": "0.1.0",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "LarkNotes",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 600,
+        "minHeight": 400
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    }
+  }
+}

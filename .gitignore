@@ -1,0 +1,22 @@
+# Rust
+/target/
+Cargo.lock
+
+# Node
+node_modules/
+dist/
+
+# Tauri
+apps/desktop/gen/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# App data
+*.db
+*.db-journal

@@ -1,0 +1,13 @@
+[package]
+name = "larknotes-provider-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+larknotes-core = { path = "../core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }

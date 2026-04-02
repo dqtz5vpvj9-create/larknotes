@@ -1,0 +1,21 @@
+[package]
+name = "larknotes-sync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+larknotes-core = { path = "../core" }
+larknotes-storage = { path = "../storage" }
+tokio = { workspace = true }
+notify = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+encoding_rs = { workspace = true }
+chardetng = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for LarkNotes",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "shell:default",
+    "core:tray:default"
+  ]
+}
