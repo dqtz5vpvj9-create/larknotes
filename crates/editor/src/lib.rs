@@ -175,4 +175,46 @@ mod tests {
         launcher.set_command("code");
         assert_eq!(launcher.command(), "code");
     }
+
+    #[test]
+    fn test_editor_launcher_command_with_spaces() {
+        let launcher = EditorLauncher::new("open -a TextEdit");
+        assert_eq!(launcher.command(), "open -a TextEdit");
+    }
+
+    #[test]
+    fn test_open_file_nonexistent_command() {
+        let launcher = EditorLauncher::new("__nonexistent_editor_12345__");
+        let result = launcher.open_file(std::path::Path::new("test.md"));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("__nonexistent_editor_12345__"), "Error should mention the command: {err_msg}");
+    }
+
+    #[test]
+    fn test_detect_editor_env_var() {
+        // Set env var and verify it's picked up
+        std::env::set_var("LARKNOTES_EDITOR", "custom-editor-test");
+        let editor = detect_editor();
+        assert_eq!(editor, "custom-editor-test");
+        // Clean up
+        std::env::remove_var("LARKNOTES_EDITOR");
+    }
+
+    #[test]
+    fn test_detect_editor_env_var_empty() {
+        std::env::set_var("LARKNOTES_EDITOR", "");
+        let editor = detect_editor();
+        // Empty env var should be ignored — falls through to PATH check
+        assert_ne!(editor, "");
+        std::env::remove_var("LARKNOTES_EDITOR");
+    }
+
+    #[test]
+    fn test_detect_editor_always_returns_something() {
+        // Even with no env var and no editors on PATH, should fallback to notepad
+        std::env::remove_var("LARKNOTES_EDITOR");
+        let editor = detect_editor();
+        assert!(!editor.is_empty());
+    }
 }

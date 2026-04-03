@@ -28,46 +28,77 @@ impl Storage {
     }
 
     fn migrate(&self) -> Result<(), LarkNotesError> {
+        // Create version tracking table
         self.conn
-            .execute_batch(
-                "
-            CREATE TABLE IF NOT EXISTS documents (
-                doc_id TEXT PRIMARY KEY,
-                title TEXT NOT NULL DEFAULT 'Untitled',
-                doc_type TEXT NOT NULL DEFAULT 'DOCX',
-                url TEXT NOT NULL DEFAULT '',
-                owner_name TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT '',
-                local_path TEXT,
-                content_hash TEXT,
-                sync_status TEXT NOT NULL DEFAULT 'New',
-                last_synced_at TEXT
-            );
+            .execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+            .map_err(|e| LarkNotesError::Storage(format!("创建版本表失败: {e}")))?;
 
-            CREATE TABLE IF NOT EXISTS app_config (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
+        let current_version: i64 = self.conn
+            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |row| row.get(0))
+            .unwrap_or(0);
 
-            CREATE TABLE IF NOT EXISTS sync_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doc_id TEXT NOT NULL,
-                action TEXT NOT NULL,
-                content_hash TEXT,
-                created_at TEXT NOT NULL
-            );
+        let migrations: Vec<(i64, &str)> = vec![
+            (1, "
+                CREATE TABLE IF NOT EXISTS documents (
+                    doc_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT 'Untitled',
+                    doc_type TEXT NOT NULL DEFAULT 'DOCX',
+                    url TEXT NOT NULL DEFAULT '',
+                    owner_name TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    local_path TEXT,
+                    content_hash TEXT,
+                    remote_hash TEXT,
+                    sync_status TEXT NOT NULL DEFAULT 'New',
+                    last_synced_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS app_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sync_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    doc_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    content_hash TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS version_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    doc_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+            "),
+            (2, "
+                -- Add remote_hash column if upgrading from v0
+                ALTER TABLE documents ADD COLUMN remote_hash TEXT;
+            "),
+        ];
 
-            CREATE TABLE IF NOT EXISTS version_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doc_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            ",
-            )
-            .map_err(|e| LarkNotesError::Storage(format!("数据库迁移失败: {e}")))?;
+        for (version, sql) in &migrations {
+            if *version > current_version {
+                // Try to run, ignoring "duplicate column" errors for ALTER TABLE
+                let result = self.conn.execute_batch(sql);
+                match result {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let msg = e.to_string();
+                        // Ignore "duplicate column name" from ALTER TABLE on existing DBs
+                        if !msg.contains("duplicate column name") {
+                            return Err(LarkNotesError::Storage(format!("迁移v{version}失败: {e}")));
+                        }
+                    }
+                }
+                self.conn
+                    .execute("INSERT INTO schema_version (version) VALUES (?1)", params![version])
+                    .map_err(|e| LarkNotesError::Storage(format!("记录迁移版本失败: {e}")))?;
+                tracing::info!("数据库迁移完成: v{version}");
+            }
+        }
+
         Ok(())
     }
 
@@ -151,6 +182,16 @@ impl Storage {
                 params![hash, doc_id],
             )
             .map_err(|e| LarkNotesError::Storage(format!("更新哈希失败: {e}")))?;
+        Ok(())
+    }
+
+    pub fn update_local_path(&self, doc_id: &str, path: &str) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "UPDATE documents SET local_path = ?1 WHERE doc_id = ?2",
+                params![path, doc_id],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("更新本地路径失败: {e}")))?;
         Ok(())
     }
 
@@ -340,6 +381,62 @@ impl Storage {
             .map_err(|e| LarkNotesError::Storage(format!("写入配置失败: {e}")))?;
         Ok(())
     }
+
+    /// Search documents locally by title (case-insensitive)
+    pub fn search_docs_local(&self, query: &str) -> Result<Vec<DocMeta>, LarkNotesError> {
+        // Escape LIKE wildcards in user input to prevent unintended matching
+        let escaped = query.replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT doc_id, title, doc_type, url, owner_name, created_at, updated_at,
+                        local_path, content_hash, sync_status
+                 FROM documents WHERE title LIKE ?1 ESCAPE '\\' COLLATE NOCASE
+                 ORDER BY updated_at DESC",
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?;
+
+        let docs = stmt
+            .query_map(params![pattern], |row| Ok(row_to_doc_meta(row)))
+            .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(docs)
+    }
+
+    /// Update remote content hash for a document
+    pub fn update_remote_hash(&self, doc_id: &str, hash: &str) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "UPDATE documents SET remote_hash = ?1 WHERE doc_id = ?2",
+                params![hash, doc_id],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("更新远程哈希失败: {e}")))?;
+        Ok(())
+    }
+
+    /// Get all documents that have local_path set (for pull checking)
+    pub fn list_synced_docs(&self) -> Result<Vec<DocMeta>, LarkNotesError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT doc_id, title, doc_type, url, owner_name, created_at, updated_at,
+                        local_path, content_hash, sync_status
+                 FROM documents WHERE local_path IS NOT NULL
+                 ORDER BY updated_at DESC",
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?;
+
+        let docs = stmt
+            .query_map([], |row| Ok(row_to_doc_meta(row)))
+            .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(docs)
+    }
 }
 
 fn row_to_doc_meta(row: &rusqlite::Row) -> DocMeta {
@@ -430,5 +527,381 @@ mod tests {
         assert!(s.get_config("editor").unwrap().is_none());
         s.set_config("editor", "typora").unwrap();
         assert_eq!(s.get_config("editor").unwrap().unwrap(), "typora");
+    }
+
+    // ─── update_content_hash ─────────────────────────────
+
+    #[test]
+    fn test_update_content_hash() {
+        let s = test_storage();
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        assert!(s.get_doc("d1").unwrap().unwrap().content_hash.is_none());
+
+        s.update_content_hash("d1", "abc123").unwrap();
+        assert_eq!(s.get_doc("d1").unwrap().unwrap().content_hash.as_deref(), Some("abc123"));
+    }
+
+    // ─── update_local_path ────────────────────────────────
+
+    #[test]
+    fn test_update_local_path() {
+        let s = test_storage();
+        let mut doc = sample_doc("d1");
+        doc.local_path = Some("/old/path.md".to_string());
+        s.upsert_doc(&doc).unwrap();
+
+        s.update_local_path("d1", "/new/path.md").unwrap();
+        let fetched = s.get_doc("d1").unwrap().unwrap();
+        assert_eq!(fetched.local_path.as_deref(), Some("/new/path.md"));
+    }
+
+    #[test]
+    fn test_update_local_path_nonexistent_doc() {
+        let s = test_storage();
+        // Should not error even if doc doesn't exist (0 rows affected)
+        s.update_local_path("nonexistent", "/some/path.md").unwrap();
+    }
+
+    // ─── update_title ────────────────────────────────────
+
+    #[test]
+    fn test_update_title() {
+        let s = test_storage();
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        s.update_title("d1", "New Title").unwrap();
+        assert_eq!(s.get_doc("d1").unwrap().unwrap().title, "New Title");
+    }
+
+    #[test]
+    fn test_update_title_unicode() {
+        let s = test_storage();
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        s.update_title("d1", "飞书笔记📝").unwrap();
+        assert_eq!(s.get_doc("d1").unwrap().unwrap().title, "飞书笔记📝");
+    }
+
+    // ─── update_remote_hash ──────────────────────────────
+
+    #[test]
+    fn test_update_remote_hash() {
+        let s = test_storage();
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        s.update_remote_hash("d1", "remote_xyz").unwrap();
+        // remote_hash is not in the standard select (row_to_doc_meta reads 10 cols)
+        // but the update should succeed without error
+    }
+
+    // ─── reset_stale_syncing ─────────────────────────────
+
+    #[test]
+    fn test_reset_stale_syncing() {
+        let s = test_storage();
+        let mut d1 = sample_doc("d1");
+        d1.sync_status = SyncStatus::Syncing;
+        s.upsert_doc(&d1).unwrap();
+
+        let mut d2 = sample_doc("d2");
+        d2.sync_status = SyncStatus::Syncing;
+        s.upsert_doc(&d2).unwrap();
+
+        let mut d3 = sample_doc("d3");
+        d3.sync_status = SyncStatus::Synced;
+        s.upsert_doc(&d3).unwrap();
+
+        let count = s.reset_stale_syncing().unwrap();
+        assert_eq!(count, 2);
+
+        assert_eq!(s.get_doc("d1").unwrap().unwrap().sync_status, SyncStatus::LocalModified);
+        assert_eq!(s.get_doc("d2").unwrap().unwrap().sync_status, SyncStatus::LocalModified);
+        assert_eq!(s.get_doc("d3").unwrap().unwrap().sync_status, SyncStatus::Synced);
+    }
+
+    #[test]
+    fn test_reset_stale_syncing_none() {
+        let s = test_storage();
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        let count = s.reset_stale_syncing().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ─── Sync History ────────────────────────────────────
+
+    #[test]
+    fn test_sync_history_crud() {
+        let s = test_storage();
+        s.add_sync_history("d1", "push", Some("hash1")).unwrap();
+        s.add_sync_history("d1", "pull", Some("hash2")).unwrap();
+        s.add_sync_history("d1", "conflict", None).unwrap();
+
+        let history = s.get_sync_history("d1", 10).unwrap();
+        assert_eq!(history.len(), 3);
+        // Ordered DESC by created_at — most recent first
+        assert_eq!(history[0].action, "conflict");
+        assert_eq!(history[1].action, "pull");
+        assert_eq!(history[2].action, "push");
+    }
+
+    #[test]
+    fn test_sync_history_limit() {
+        let s = test_storage();
+        for i in 0..10 {
+            s.add_sync_history("d1", &format!("action{i}"), None).unwrap();
+        }
+        let history = s.get_sync_history("d1", 3).unwrap();
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn test_sync_history_empty() {
+        let s = test_storage();
+        let history = s.get_sync_history("nonexistent", 10).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn test_sync_history_content_hash() {
+        let s = test_storage();
+        s.add_sync_history("d1", "push", Some("abc")).unwrap();
+        s.add_sync_history("d1", "conflict", None).unwrap();
+
+        let history = s.get_sync_history("d1", 10).unwrap();
+        assert_eq!(history[1].content_hash.as_deref(), Some("abc"));
+        assert!(history[0].content_hash.is_none());
+    }
+
+    // ─── Version Snapshots ───────────────────────────────
+
+    #[test]
+    fn test_snapshot_crud() {
+        let s = test_storage();
+        s.save_snapshot("d1", "# Hello", "hash1").unwrap();
+        s.save_snapshot("d1", "# Hello World", "hash2").unwrap();
+
+        let snaps = s.get_snapshots("d1").unwrap();
+        assert_eq!(snaps.len(), 2);
+        // Most recent first
+        assert_eq!(snaps[0].content_hash, "hash2");
+        assert_eq!(snaps[0].content, "# Hello World");
+        assert_eq!(snaps[1].content_hash, "hash1");
+    }
+
+    #[test]
+    fn test_snapshot_by_id() {
+        let s = test_storage();
+        s.save_snapshot("d1", "content here", "hash1").unwrap();
+
+        let snaps = s.get_snapshots("d1").unwrap();
+        let snap_id = snaps[0].id;
+
+        let found = s.get_snapshot_by_id(snap_id).unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().content, "content here");
+    }
+
+    #[test]
+    fn test_snapshot_by_id_nonexistent() {
+        let s = test_storage();
+        assert!(s.get_snapshot_by_id(99999).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_snapshot_cleanup_keeps_20() {
+        let s = test_storage();
+        for i in 0..25 {
+            s.save_snapshot("d1", &format!("content-{i}"), &format!("hash-{i}")).unwrap();
+        }
+        let snaps = s.get_snapshots("d1").unwrap();
+        assert_eq!(snaps.len(), 20, "should keep only 20 snapshots");
+        // Most recent should be content-24
+        assert_eq!(snaps[0].content, "content-24");
+    }
+
+    #[test]
+    fn test_snapshot_per_doc_isolation() {
+        let s = test_storage();
+        s.save_snapshot("d1", "doc1 content", "h1").unwrap();
+        s.save_snapshot("d2", "doc2 content", "h2").unwrap();
+
+        assert_eq!(s.get_snapshots("d1").unwrap().len(), 1);
+        assert_eq!(s.get_snapshots("d2").unwrap().len(), 1);
+    }
+
+    // ─── search_docs_local ───────────────────────────────
+
+    #[test]
+    fn test_search_docs_local_exact() {
+        let s = test_storage();
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        let results = s.search_docs_local("Test Doc").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, "d1");
+    }
+
+    #[test]
+    fn test_search_docs_local_partial() {
+        let s = test_storage();
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        let results = s.search_docs_local("Test").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_docs_local_case_insensitive() {
+        let s = test_storage();
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        let results = s.search_docs_local("test doc").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_docs_local_no_match() {
+        let s = test_storage();
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        let results = s.search_docs_local("Nonexistent").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_docs_local_wildcard_escape() {
+        let s = test_storage();
+        let mut doc = sample_doc("d1");
+        doc.title = "100% complete".to_string();
+        s.upsert_doc(&doc).unwrap();
+
+        let mut doc2 = sample_doc("d2");
+        doc2.title = "100 items".to_string();
+        s.upsert_doc(&doc2).unwrap();
+
+        // Searching for "100%" should only match doc with literal %
+        let results = s.search_docs_local("100%").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, "d1");
+    }
+
+    #[test]
+    fn test_search_docs_local_underscore_escape() {
+        let s = test_storage();
+        let mut doc = sample_doc("d1");
+        doc.title = "test_doc".to_string();
+        s.upsert_doc(&doc).unwrap();
+
+        let mut doc2 = sample_doc("d2");
+        doc2.title = "testXdoc".to_string();
+        s.upsert_doc(&doc2).unwrap();
+
+        // Without escaping, _ matches any char → both match
+        // With proper escaping, only literal _ matches
+        let results = s.search_docs_local("test_doc").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, "d1");
+    }
+
+    // ─── list_synced_docs ────────────────────────────────
+
+    #[test]
+    fn test_list_synced_docs() {
+        let s = test_storage();
+        let d1 = sample_doc("d1"); // local_path = None
+        s.upsert_doc(&d1).unwrap();
+
+        let mut d2 = sample_doc("d2");
+        d2.local_path = Some("/path/to/doc.md".to_string());
+        s.upsert_doc(&d2).unwrap();
+
+        let synced = s.list_synced_docs().unwrap();
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].doc_id, "d2");
+    }
+
+    // ─── list_docs ordering ──────────────────────────────
+
+    #[test]
+    fn test_list_docs_empty() {
+        let s = test_storage();
+        assert!(s.list_docs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_list_docs_order_by_updated_at() {
+        let s = test_storage();
+        let mut d1 = sample_doc("d1");
+        d1.updated_at = "2026-01-01T00:00:00+08:00".to_string();
+        s.upsert_doc(&d1).unwrap();
+
+        let mut d2 = sample_doc("d2");
+        d2.updated_at = "2026-02-01T00:00:00+08:00".to_string();
+        s.upsert_doc(&d2).unwrap();
+
+        let docs = s.list_docs().unwrap();
+        assert_eq!(docs[0].doc_id, "d2"); // more recent first
+        assert_eq!(docs[1].doc_id, "d1");
+    }
+
+    // ─── Migration idempotency ───────────────────────────
+
+    #[test]
+    fn test_migrate_idempotent() {
+        let s = test_storage();
+        // migrate() is called in new_in_memory(), calling it again should be safe
+        s.migrate().unwrap();
+        s.migrate().unwrap();
+        // DB should still work
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        assert!(s.get_doc("d1").unwrap().is_some());
+    }
+
+    // ─── File-based DB ───────────────────────────────────
+
+    #[test]
+    fn test_new_file_based() {
+        let tmp = std::env::temp_dir().join("larknotes_test_storage_file");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let db_path = tmp.join("test.db");
+
+        let s = Storage::new(&db_path).unwrap();
+        assert!(db_path.exists());
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        assert!(s.get_doc("d1").unwrap().is_some());
+
+        // Reopen same file
+        let s2 = Storage::new(&db_path).unwrap();
+        assert!(s2.get_doc("d1").unwrap().is_some());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── SyncStatus roundtrip ────────────────────────────
+
+    #[test]
+    fn test_upsert_doc_error_status_roundtrip() {
+        let s = test_storage();
+        let mut doc = sample_doc("d1");
+        doc.sync_status = SyncStatus::Error("网络异常，第2次重试中...".to_string());
+        s.upsert_doc(&doc).unwrap();
+
+        let fetched = s.get_doc("d1").unwrap().unwrap();
+        assert_eq!(
+            fetched.sync_status,
+            SyncStatus::Error("网络异常，第2次重试中...".to_string())
+        );
+    }
+
+    // ─── Config overwrite ────────────────────────────────
+
+    #[test]
+    fn test_config_overwrite() {
+        let s = test_storage();
+        s.set_config("key", "value1").unwrap();
+        s.set_config("key", "value2").unwrap();
+        assert_eq!(s.get_config("key").unwrap().unwrap(), "value2");
+    }
+
+    // ─── Delete nonexistent ──────────────────────────────
+
+    #[test]
+    fn test_delete_nonexistent() {
+        let s = test_storage();
+        // Should not error
+        s.delete_doc("nonexistent").unwrap();
     }
 }

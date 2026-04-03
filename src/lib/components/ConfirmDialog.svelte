@@ -11,13 +11,29 @@
 
   let { title, message, confirmLabel = "确认", cancelLabel = "取消", danger = false, onConfirm, onCancel }: Props = $props();
 
+  let confirmBtn: HTMLButtonElement | undefined = $state();
+
+  $effect(() => {
+    confirmBtn?.focus();
+  });
+
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") onCancel();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      onConfirm();
+    }
+  }
+
+  function handleOverlayClick() {
+    // Don't dismiss danger dialogs on overlay click — require explicit button
+    if (!danger) onCancel();
   }
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="overlay" onkeydown={handleKeydown} onclick={onCancel}>
+<div class="overlay" onkeydown={handleKeydown} onclick={handleOverlayClick} role="dialog" aria-modal="true" aria-label={title} tabindex="-1">
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="dialog" onclick={(e: MouseEvent) => e.stopPropagation()}>
     <h3 class="dialog-title">{title}</h3>
@@ -27,6 +43,7 @@
       <button
         class="btn-confirm"
         class:btn-confirm--danger={danger}
+        bind:this={confirmBtn}
         onclick={onConfirm}
       >
         {confirmLabel}

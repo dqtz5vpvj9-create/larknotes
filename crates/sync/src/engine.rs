@@ -4,6 +4,7 @@ use larknotes_storage::Storage;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{Duration, Instant};
@@ -51,7 +52,7 @@ pub struct SyncEngine {
     provider: Arc<dyn DocProvider>,
     storage: Arc<Mutex<Storage>>,
     workspace_dir: PathBuf,
-    debounce_ms: u64,
+    debounce_ms: Arc<AtomicU64>,
     status_tx: broadcast::Sender<SyncStatusUpdate>,
 }
 
@@ -60,7 +61,7 @@ impl SyncEngine {
         provider: Arc<dyn DocProvider>,
         storage: Arc<Mutex<Storage>>,
         workspace_dir: PathBuf,
-        debounce_ms: u64,
+        debounce_ms: Arc<AtomicU64>,
     ) -> (Self, broadcast::Receiver<SyncStatusUpdate>) {
         let (status_tx, status_rx) = broadcast::channel(64);
         (
@@ -94,7 +95,7 @@ impl SyncEngine {
                     match event {
                         SyncEvent::FileChanged { doc_id, .. } => {
                             let deadline = Instant::now()
-                                + Duration::from_millis(engine.debounce_ms);
+                                + Duration::from_millis(engine.debounce_ms.load(Ordering::Relaxed));
                             debounce_timers.insert(doc_id.clone(), deadline);
                             tracing::debug!("文件变更, 等待debounce: {doc_id}");
                         }
@@ -259,6 +260,38 @@ impl SyncEngine {
             let _ = store.update_title(doc_id, title);
             let _ = store.add_sync_history(doc_id, "push", Some(new_hash));
             let _ = store.save_snapshot(doc_id, content, new_hash);
+
+            // Rename local file if title changed (filename = title convention)
+            if let Ok(Some(doc)) = store.get_doc(doc_id) {
+                if let Some(ref old_path_str) = doc.local_path {
+                    let old_path = std::path::PathBuf::from(old_path_str);
+                    // Compare with titled_content_path (not unique_) to check if rename is needed.
+                    // If old_path already matches the title, no rename needed.
+                    let expected_path = titled_content_path(&self.workspace_dir, title);
+                    if old_path != expected_path && old_path.exists() {
+                        // Use unique_content_path for the actual target to avoid collisions
+                        let new_path = unique_content_path(&self.workspace_dir, title);
+                        // Update DB first to prevent watcher from triggering on intermediate state
+                        let new_path_str = new_path.to_string_lossy().to_string();
+                        let _ = store.update_local_path(doc_id, &new_path_str);
+                        if let Err(e) = std::fs::rename(&old_path, &new_path) {
+                            tracing::warn!(
+                                "重命名文件失败 {} → {}: {e}",
+                                old_path.display(),
+                                new_path.display()
+                            );
+                            // Revert DB if rename failed
+                            let _ = store.update_local_path(doc_id, old_path_str);
+                        } else {
+                            tracing::info!(
+                                "文件已重命名: {} → {}",
+                                old_path.display(),
+                                new_path.display()
+                            );
+                        }
+                    }
+                }
+            }
         }
         self.emit_status(doc_id, SyncStatus::Synced, Some(title.to_string()));
         tracing::info!("同步成功: {doc_id}");
@@ -301,11 +334,13 @@ impl SyncEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     // Mock DocProvider for testing
     struct MockProvider {
         update_should_fail: AtomicBool,
+        /// If > 0, fail this many times with transient error, then succeed
+        transient_fail_count: std::sync::atomic::AtomicI32,
         updated_docs: Mutex<Vec<(String, String)>>,
     }
 
@@ -313,12 +348,18 @@ mod tests {
         fn new() -> Self {
             Self {
                 update_should_fail: AtomicBool::new(false),
+                transient_fail_count: std::sync::atomic::AtomicI32::new(0),
                 updated_docs: Mutex::new(Vec::new()),
             }
         }
 
         fn set_fail(&self, fail: bool) {
             self.update_should_fail.store(fail, Ordering::SeqCst);
+        }
+
+        /// Set transient failures: fail N times then succeed
+        fn set_transient_failures(&self, count: i32) {
+            self.transient_fail_count.store(count, Ordering::SeqCst);
         }
 
         fn get_updates(&self) -> Vec<(String, String)> {
@@ -346,8 +387,14 @@ mod tests {
             Ok(String::new())
         }
         async fn update_doc(&self, doc_id: &str, markdown: &str) -> Result<(), LarkNotesError> {
+            // Permanent failure mode
             if self.update_should_fail.load(Ordering::SeqCst) {
                 return Err(LarkNotesError::Auth("404 not found".into()));
+            }
+            // Transient failure mode: decrement counter, fail if > 0
+            let remaining = self.transient_fail_count.fetch_sub(1, Ordering::SeqCst);
+            if remaining > 0 {
+                return Err(LarkNotesError::Cli("connection timeout".into()));
             }
             self.updated_docs
                 .lock()
@@ -400,7 +447,7 @@ mod tests {
         create_test_doc(&workspace, &storage, "doc1", "Hello", "# Hello\n\nWorld", None);
 
         let (engine, mut status_rx) = SyncEngine::new(
-            provider.clone(), storage.clone(), workspace, 2000,
+            provider.clone(), storage.clone(), workspace, Arc::new(AtomicU64::new(2000)),
         );
         let engine = Arc::new(engine);
         engine.sync_one("doc1").await;
@@ -430,7 +477,7 @@ mod tests {
         let hash = hash_content(content.as_bytes());
         create_test_doc(&workspace, &storage, "doc2", "Same", content, Some(hash));
 
-        let (engine, _) = SyncEngine::new(provider.clone(), storage, workspace, 2000);
+        let (engine, _) = SyncEngine::new(provider.clone(), storage, workspace, Arc::new(AtomicU64::new(2000)));
         let engine = Arc::new(engine);
         engine.sync_one("doc2").await;
 
@@ -447,7 +494,7 @@ mod tests {
         create_test_doc(&workspace, &storage, "doc3", "Conflict", "# Conflict test", None);
 
         let (engine, mut status_rx) = SyncEngine::new(
-            provider.clone(), storage.clone(), workspace.clone(), 2000,
+            provider.clone(), storage.clone(), workspace.clone(), Arc::new(AtomicU64::new(2000)),
         );
         let engine = Arc::new(engine);
         engine.sync_one("doc3").await;
@@ -478,7 +525,7 @@ mod tests {
 
         create_test_doc(&workspace, &storage, "doc4", "Old Title", "# My Custom Title\n\nBody", None);
 
-        let (engine, _) = SyncEngine::new(provider, storage.clone(), workspace, 2000);
+        let (engine, _) = SyncEngine::new(provider, storage.clone(), workspace, Arc::new(AtomicU64::new(2000)));
         let engine = Arc::new(engine);
         engine.sync_one("doc4").await;
 
@@ -486,7 +533,7 @@ mod tests {
         assert_eq!(doc.title, "My Custom Title");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_sync_engine_debounce() {
         let (tmp, storage) = setup_test_workspace();
         let workspace = tmp.path().to_path_buf();
@@ -495,7 +542,7 @@ mod tests {
         create_test_doc(&workspace, &storage, "doc5", "Debounce", "# Debounce test", None);
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let (engine, _) = SyncEngine::new(provider.clone(), storage, workspace, 500);
+        let (engine, _) = SyncEngine::new(provider.clone(), storage, workspace, Arc::new(AtomicU64::new(500)));
         let engine = Arc::new(engine);
 
         let engine_clone = engine.clone();
@@ -520,7 +567,7 @@ mod tests {
         handle.await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_sync_engine_manual_sync() {
         let (tmp, storage) = setup_test_workspace();
         let workspace = tmp.path().to_path_buf();
@@ -529,7 +576,7 @@ mod tests {
         create_test_doc(&workspace, &storage, "doc6", "Manual", "# Manual sync test", None);
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let (engine, _) = SyncEngine::new(provider.clone(), storage, workspace, 2000);
+        let (engine, _) = SyncEngine::new(provider.clone(), storage, workspace, Arc::new(AtomicU64::new(2000)));
         let engine = Arc::new(engine);
 
         let engine_clone = engine.clone();
@@ -544,5 +591,335 @@ mod tests {
 
         tx.send(SyncEvent::Shutdown).unwrap();
         handle.await.unwrap();
+    }
+
+    // ─── decode_content tests ────────────────────────────
+
+    #[test]
+    fn test_decode_content_utf8() {
+        let content = "# Hello 你好";
+        let decoded = decode_content(content.as_bytes());
+        assert_eq!(decoded, "# Hello 你好");
+    }
+
+    #[test]
+    fn test_decode_content_utf8_bom() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM
+        bytes.extend_from_slice("# BOM test".as_bytes());
+        let decoded = decode_content(&bytes);
+        assert_eq!(decoded, "# BOM test");
+    }
+
+    #[test]
+    fn test_decode_content_utf16_le_bom() {
+        let mut bytes = vec![0xFF, 0xFE]; // UTF-16 LE BOM
+        for ch in "Hello".encode_utf16() {
+            bytes.extend_from_slice(&ch.to_le_bytes());
+        }
+        let decoded = decode_content(&bytes);
+        assert_eq!(decoded, "Hello");
+    }
+
+    #[test]
+    fn test_decode_content_utf16_be_bom() {
+        let mut bytes = vec![0xFE, 0xFF]; // UTF-16 BE BOM
+        for ch in "Hello".encode_utf16() {
+            bytes.extend_from_slice(&ch.to_be_bytes());
+        }
+        let decoded = decode_content(&bytes);
+        assert_eq!(decoded, "Hello");
+    }
+
+    #[test]
+    fn test_decode_content_empty() {
+        assert_eq!(decode_content(&[]), "");
+    }
+
+    #[test]
+    fn test_decode_content_ascii() {
+        let decoded = decode_content(b"plain ASCII text 123");
+        assert_eq!(decoded, "plain ASCII text 123");
+    }
+
+    #[test]
+    fn test_decode_content_gbk() {
+        // "你好世界" in GBK — longer text helps chardetng identify the encoding
+        let (encoded, _, _) = encoding_rs::GBK.encode("你好世界，这是一段中文测试文本。");
+        let decoded = decode_content(&encoded);
+        assert!(decoded.contains("你好"), "GBK decode should contain 你好, got: {decoded}");
+    }
+
+    // ─── sync_one edge cases ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_sync_one_nonexistent_doc() {
+        let (tmp, storage) = setup_test_workspace();
+        let workspace = tmp.path().to_path_buf();
+        let provider = Arc::new(MockProvider::new());
+
+        let (engine, _) = SyncEngine::new(
+            provider.clone(), storage, workspace, Arc::new(AtomicU64::new(2000)),
+        );
+        let engine = Arc::new(engine);
+
+        // Should return without crash — doc not in storage
+        engine.sync_one("nonexistent").await;
+        assert!(provider.get_updates().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sync_one_file_missing() {
+        let (tmp, storage) = setup_test_workspace();
+        let workspace = tmp.path().to_path_buf();
+        let provider = Arc::new(MockProvider::new());
+
+        // Create doc in storage with a local_path that doesn't exist on disk
+        let fake_path = workspace.join("docs/ghost.md");
+        let meta = DocMeta {
+            doc_id: "ghost".to_string(),
+            title: "Ghost".to_string(),
+            doc_type: "DOCX".to_string(),
+            url: "".to_string(),
+            owner_name: "test".to_string(),
+            created_at: "2026-01-01".to_string(),
+            updated_at: "2026-01-01".to_string(),
+            local_path: Some(fake_path.to_string_lossy().to_string()),
+            content_hash: None,
+            sync_status: SyncStatus::Synced,
+        };
+        storage.lock().unwrap().upsert_doc(&meta).unwrap();
+
+        let (engine, _) = SyncEngine::new(
+            provider.clone(), storage, workspace, Arc::new(AtomicU64::new(2000)),
+        );
+        let engine = Arc::new(engine);
+
+        // Should not panic, just fail to read and return
+        engine.sync_one("ghost").await;
+        assert!(provider.get_updates().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_sync_one_transient_retry_success() {
+        let (tmp, storage) = setup_test_workspace();
+        let workspace = tmp.path().to_path_buf();
+        let provider = Arc::new(MockProvider::new());
+        // Fail once with transient error, then succeed
+        provider.set_transient_failures(1);
+
+        create_test_doc(&workspace, &storage, "retry_doc", "Retry", "# Retry test", None);
+
+        let (engine, _) = SyncEngine::new(
+            provider.clone(), storage.clone(), workspace, Arc::new(AtomicU64::new(100)),
+        );
+        let engine = Arc::new(engine);
+        engine.sync_one("retry_doc").await;
+
+        // Should have retried and succeeded
+        let updates = provider.get_updates();
+        assert_eq!(updates.len(), 1, "Should succeed after 1 retry");
+        let doc = storage.lock().unwrap().get_doc("retry_doc").unwrap().unwrap();
+        assert_eq!(doc.sync_status, SyncStatus::Synced);
+    }
+
+    // Note: retry exhaustion with real delays (5+15+45=65s) is too slow for unit tests.
+    // The permanent error test (test_sync_one_handles_conflict) already covers
+    // the conflict path. The transient retry test covers the retry→success path.
+    // For full retry exhaustion, use integration tests with shorter delays.
+
+    // ─── Engine: multi-doc debounce ──────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn test_sync_engine_multi_doc_debounce() {
+        let (tmp, storage) = setup_test_workspace();
+        let workspace = tmp.path().to_path_buf();
+        let provider = Arc::new(MockProvider::new());
+
+        create_test_doc(&workspace, &storage, "docA", "DocA", "# DocA", None);
+        create_test_doc(&workspace, &storage, "docB", "DocB", "# DocB", None);
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (engine, _) = SyncEngine::new(provider.clone(), storage, workspace, Arc::new(AtomicU64::new(300)));
+        let engine = Arc::new(engine);
+
+        let engine_clone = engine.clone();
+        let handle = tokio::spawn(async move {
+            SyncEngine::run(engine_clone, rx).await;
+        });
+
+        // Fire both docs
+        tx.send(SyncEvent::FileChanged { doc_id: "docA".into(), path: PathBuf::new() }).unwrap();
+        tx.send(SyncEvent::FileChanged { doc_id: "docB".into(), path: PathBuf::new() }).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        let updates = provider.get_updates();
+        assert_eq!(updates.len(), 2, "Both docs should be synced independently");
+        let doc_ids: Vec<&str> = updates.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(doc_ids.contains(&"docA"));
+        assert!(doc_ids.contains(&"docB"));
+
+        tx.send(SyncEvent::Shutdown).unwrap();
+        handle.await.unwrap();
+    }
+
+    // ─── Engine: SyncRequested bypasses debounce ─────────
+
+    #[tokio::test(start_paused = true)]
+    async fn test_sync_requested_bypasses_debounce() {
+        let (tmp, storage) = setup_test_workspace();
+        let workspace = tmp.path().to_path_buf();
+        let provider = Arc::new(MockProvider::new());
+
+        create_test_doc(&workspace, &storage, "bypass", "Bypass", "# Bypass test", None);
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Very long debounce — FileChanged would wait 10s, but SyncRequested is immediate
+        let (engine, _) = SyncEngine::new(provider.clone(), storage, workspace, Arc::new(AtomicU64::new(10_000)));
+        let engine = Arc::new(engine);
+
+        let engine_clone = engine.clone();
+        let handle = tokio::spawn(async move {
+            SyncEngine::run(engine_clone, rx).await;
+        });
+
+        tx.send(SyncEvent::SyncRequested { doc_id: "bypass".into() }).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(provider.get_updates().len(), 1, "SyncRequested should bypass debounce");
+
+        tx.send(SyncEvent::Shutdown).unwrap();
+        handle.await.unwrap();
+    }
+
+    // ─── sync_one: records history and snapshot ──────────
+
+    #[tokio::test]
+    async fn test_sync_one_records_history_and_snapshot() {
+        let (tmp, storage) = setup_test_workspace();
+        let workspace = tmp.path().to_path_buf();
+        let provider = Arc::new(MockProvider::new());
+
+        create_test_doc(&workspace, &storage, "hist_doc", "History", "# History test", None);
+
+        let (engine, _) = SyncEngine::new(
+            provider.clone(), storage.clone(), workspace, Arc::new(AtomicU64::new(2000)),
+        );
+        let engine = Arc::new(engine);
+        engine.sync_one("hist_doc").await;
+
+        let store = storage.lock().unwrap();
+        let history = store.get_sync_history("hist_doc", 10).unwrap();
+        assert!(!history.is_empty(), "Should record push in sync history");
+        assert_eq!(history[0].action, "push");
+
+        let snapshots = store.get_snapshots("hist_doc").unwrap();
+        assert!(!snapshots.is_empty(), "Should save content snapshot");
+        assert_eq!(snapshots[0].content, "# History test");
+    }
+
+    // ─── Scenario 1: title change in editor → file rename ──
+
+    #[tokio::test]
+    async fn test_mark_synced_renames_file_on_title_change() {
+        let (tmp, storage) = setup_test_workspace();
+        let workspace = tmp.path().to_path_buf();
+        let provider = Arc::new(MockProvider::new());
+
+        // Create doc with title "Old Title"
+        let old_path = create_test_doc(
+            &workspace, &storage, "doc_rename", "Old Title",
+            "# Old Title\n\nBody", None,
+        );
+        assert!(old_path.exists());
+
+        // User edits the file to change the title
+        std::fs::write(&old_path, "# New Title\n\nBody").unwrap();
+
+        let (engine, _) = SyncEngine::new(
+            provider.clone(), storage.clone(), workspace.clone(),
+            Arc::new(AtomicU64::new(2000)),
+        );
+        let engine = Arc::new(engine);
+        engine.sync_one("doc_rename").await;
+
+        // File should be renamed to "New Title.md"
+        let new_path = workspace.join("docs").join("New Title.md");
+        assert!(new_path.exists(), "File should be renamed to New Title.md");
+        assert!(!old_path.exists(), "Old file should no longer exist");
+
+        // DB should have updated local_path
+        let doc = storage.lock().unwrap().get_doc("doc_rename").unwrap().unwrap();
+        assert_eq!(doc.title, "New Title");
+        assert_eq!(
+            doc.local_path.unwrap(),
+            new_path.to_string_lossy().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_synced_no_rename_when_title_unchanged() {
+        let (tmp, storage) = setup_test_workspace();
+        let workspace = tmp.path().to_path_buf();
+        let provider = Arc::new(MockProvider::new());
+
+        let path = create_test_doc(
+            &workspace, &storage, "doc_same", "Same Title",
+            "# Same Title\n\nOld body", None,
+        );
+
+        // Edit body only, title unchanged
+        std::fs::write(&path, "# Same Title\n\nNew body").unwrap();
+
+        let (engine, _) = SyncEngine::new(
+            provider.clone(), storage.clone(), workspace.clone(),
+            Arc::new(AtomicU64::new(2000)),
+        );
+        let engine = Arc::new(engine);
+        engine.sync_one("doc_same").await;
+
+        // File should still be at the same path
+        assert!(path.exists(), "File should not move when title is unchanged");
+        let doc = storage.lock().unwrap().get_doc("doc_same").unwrap().unwrap();
+        assert_eq!(doc.local_path.unwrap(), path.to_string_lossy().to_string());
+    }
+
+    // ─── Scenario 5: title collision → unique path ──────────
+
+    #[tokio::test]
+    async fn test_mark_synced_title_collision_uses_unique_path() {
+        let (tmp, storage) = setup_test_workspace();
+        let workspace = tmp.path().to_path_buf();
+        let provider = Arc::new(MockProvider::new());
+
+        // Create two docs, one already has the target filename
+        create_test_doc(
+            &workspace, &storage, "existing_doc", "Target Title",
+            "# Target Title\n\nExisting doc", Some(hash_content(b"# Target Title\n\nExisting doc")),
+        );
+
+        let old_path = create_test_doc(
+            &workspace, &storage, "moving_doc", "Old Name",
+            "# Old Name\n\nBody", None,
+        );
+
+        // Edit file to change title to collide
+        std::fs::write(&old_path, "# Target Title\n\nBody").unwrap();
+
+        let (engine, _) = SyncEngine::new(
+            provider.clone(), storage.clone(), workspace.clone(),
+            Arc::new(AtomicU64::new(2000)),
+        );
+        let engine = Arc::new(engine);
+        engine.sync_one("moving_doc").await;
+
+        // Should get "Target Title (2).md" since "Target Title.md" already exists
+        let unique_path = workspace.join("docs").join("Target Title (2).md");
+        assert!(unique_path.exists(), "Should use unique path to avoid collision");
+        assert!(!old_path.exists(), "Old file should be gone");
+
+        // Original doc should be untouched
+        let existing = workspace.join("docs").join("Target Title.md");
+        assert!(existing.exists(), "Existing doc should not be overwritten");
     }
 }

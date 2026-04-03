@@ -7,6 +7,9 @@ export const getAuthStatus = () =>
 export const searchDocs = (query: string) =>
   invoke<DocMeta[]>("search_docs", { query });
 
+export const searchDocsLocal = (query: string) =>
+  invoke<DocMeta[]>("search_docs_local", { query });
+
 export const createDoc = (title: string) =>
   invoke<DocMeta>("create_doc", { title });
 
@@ -60,3 +63,24 @@ export const getAutostartStatus = () =>
 
 export const setAutostart = (enabled: boolean) =>
   invoke<void>("set_autostart", { enabled });
+
+export const pullDoc = (docId: string) =>
+  invoke<DocMeta>("pull_doc", { docId });
+
+export const setSyncDebounce = (ms: number) =>
+  invoke<void>("set_sync_debounce", { ms });
+
+export const setAutoSync = (enabled: boolean) =>
+  invoke<void>("set_auto_sync", { enabled });
+
+export const setLarkCliPath = (path: string) =>
+  invoke<void>("set_lark_cli_path", { path });
+
+export const openLoginUrl = () =>
+  invoke<string>("open_login_url");
+
+export const resolveConflict = (docId: string, resolution: string) =>
+  invoke<DocMeta>("resolve_conflict", { docId, resolution });
+
+export const getConflictDiff = (docId: string) =>
+  invoke<[string, string]>("get_conflict_diff", { docId });

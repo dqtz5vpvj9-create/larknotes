@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { DocMeta } from "../types";
+  import { highlightSegments } from "../types";
 
   interface Command {
     id: string;
@@ -65,7 +66,9 @@
   });
 
   $effect(() => {
-    // Reset selection when results change
+    // Read filteredCommands to establish dependency tracking,
+    // then reset selection whenever the list changes
+    filteredCommands;
     selectedIndex = 0;
   });
 
@@ -96,23 +99,7 @@
     }
   }
 
-  /** Highlight matching segments in text */
-  function highlightSegments(text: string, q: string): { text: string; match: boolean }[] {
-    if (!q) return [{ text, match: false }];
-    const lower = text.toLowerCase();
-    const qLower = q.toLowerCase();
-    const segments: { text: string; match: boolean }[] = [];
-    let lastIndex = 0;
-    let idx = lower.indexOf(qLower);
-    while (idx !== -1) {
-      if (idx > lastIndex) segments.push({ text: text.slice(lastIndex, idx), match: false });
-      segments.push({ text: text.slice(idx, idx + q.length), match: true });
-      lastIndex = idx + q.length;
-      idx = lower.indexOf(qLower, lastIndex);
-    }
-    if (lastIndex < text.length) segments.push({ text: text.slice(lastIndex), match: false });
-    return segments.length ? segments : [{ text, match: false }];
-  }
+  // highlightSegments imported from types.ts
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -261,7 +248,7 @@
   }
 
   .palette-highlight {
-    background: rgba(212,165,71,0.25);
+    background: var(--c-accent-bg-strong);
     color: var(--c-accent);
     border-radius: 2px;
     padding: 0 1px;

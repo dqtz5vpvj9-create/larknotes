@@ -30,11 +30,12 @@
 </script>
 
 {#if messages.length > 0}
-  <div class="toast-stack">
+  <div class="toast-stack" role="status" aria-live="polite">
     {#each messages as msg (msg.id)}
       <div
         class="toast"
         style="border-color: {borderColor(msg.type)}"
+        role={msg.type === "error" ? "alert" : undefined}
       >
         <div class="toast-dot" style="background: {dotColor(msg.type)}"></div>
         <span class="toast-msg">{msg.text}</span>
@@ -56,7 +57,7 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
-    z-index: 100;
+    z-index: 1100;
   }
   .toast {
     display: flex;
@@ -65,7 +66,6 @@
     padding: 10px 14px;
     border-radius: var(--radius-lg);
     background: var(--c-bg-elevated);
-    border: 1px solid rgba(212,91,91,0.2);
     box-shadow: 0 8px 24px rgba(0,0,0,0.4);
     max-width: 360px;
     animation: toastIn 250ms ease both;
@@ -86,6 +86,9 @@
     font-size: 12px;
     color: var(--c-text);
     line-height: 1.5;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    min-width: 0;
   }
   .toast-close {
     display: flex;

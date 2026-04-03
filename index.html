@@ -67,6 +67,14 @@
         --radius-pill: 100px;
         --transition: 150ms cubic-bezier(0.4, 0, 0.2, 1);
         --transition-slow: 250ms cubic-bezier(0.4, 0, 0.2, 1);
+        /* Derived accent colors for consistent theming */
+        --c-accent-bg: rgba(212,165,71,0.1);
+        --c-accent-bg-strong: rgba(212,165,71,0.25);
+        --c-accent-border: rgba(212,165,71,0.3);
+        --c-red-bg: rgba(212,91,91,0.1);
+        --c-red-border: rgba(212,91,91,0.2);
+        --c-blue-bg: rgba(91,159,212,0.1);
+        --c-amber-bg: rgba(212,194,71,0.1);
       }
       /* Light theme */
       [data-theme="light"] {
@@ -85,6 +93,13 @@
         --c-amber: #c49230;
         --c-red: #c44040;
         --c-yellow: #b8a020;
+        --c-accent-bg: rgba(196,146,48,0.1);
+        --c-accent-bg-strong: rgba(196,146,48,0.25);
+        --c-accent-border: rgba(196,146,48,0.3);
+        --c-red-bg: rgba(196,64,64,0.1);
+        --c-red-border: rgba(196,64,64,0.2);
+        --c-blue-bg: rgba(53,128,184,0.1);
+        --c-amber-bg: rgba(196,146,48,0.1);
       }
       [data-theme="light"] ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); }
       [data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.2); }
@@ -103,10 +118,10 @@
       ::-webkit-scrollbar-track { background: transparent; }
       ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
       ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); }
-      ::selection { background: rgba(212,165,71,0.3); }
+      ::selection { background: var(--c-accent-border); }
       input::placeholder { color: var(--c-text-tertiary); }
-      :focus-visible { outline: 2px solid rgba(212,165,71,0.4); outline-offset: 1px; border-radius: var(--radius); }
-      button:focus-visible, [role="button"]:focus-visible { outline: 2px solid rgba(212,165,71,0.4); outline-offset: 1px; }
+      :focus-visible { outline: 2px solid var(--c-accent-border); outline-offset: 1px; border-radius: var(--radius); }
+      button:focus-visible, [role="button"]:focus-visible { outline: 2px solid var(--c-accent-border); outline-offset: 1px; }
     </style>
   </head>
   <body>

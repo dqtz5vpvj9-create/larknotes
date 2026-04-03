@@ -46,6 +46,136 @@ impl Serialize for LarkNotesError {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("LarkNotesError", 2)?;
+        let kind = match self {
+            LarkNotesError::Cli(_) => "cli",
+            LarkNotesError::Storage(_) => "storage",
+            LarkNotesError::Sync(_) => "sync",
+            LarkNotesError::Editor(_) => "editor",
+            LarkNotesError::Auth(_) => "auth",
+            LarkNotesError::Other(_) => "other",
+        };
+        s.serialize_field("kind", kind)?;
+        s.serialize_field("message", &self.to_string())?;
+        s.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── is_transient() ──────────────────────────────────
+
+    #[test]
+    fn test_transient_cli_error() {
+        assert!(LarkNotesError::Cli("connection reset".into()).is_transient());
+    }
+
+    #[test]
+    fn test_transient_sync_error() {
+        assert!(LarkNotesError::Sync("write failed".into()).is_transient());
+    }
+
+    #[test]
+    fn test_transient_timeout() {
+        assert!(LarkNotesError::Other("request timeout".into()).is_transient());
+    }
+
+    #[test]
+    fn test_transient_network() {
+        assert!(LarkNotesError::Other("network unreachable".into()).is_transient());
+    }
+
+    #[test]
+    fn test_transient_connection() {
+        assert!(LarkNotesError::Other("connection refused".into()).is_transient());
+    }
+
+    #[test]
+    fn test_transient_5xx() {
+        assert!(LarkNotesError::Other("server returned 500".into()).is_transient());
+        assert!(LarkNotesError::Other("502 bad gateway".into()).is_transient());
+        assert!(LarkNotesError::Other("503 service unavailable".into()).is_transient());
+        assert!(LarkNotesError::Other("504 gateway timeout".into()).is_transient());
+    }
+
+    #[test]
+    fn test_permanent_401() {
+        assert!(!LarkNotesError::Cli("401 unauthorized".into()).is_transient());
+    }
+
+    #[test]
+    fn test_permanent_403() {
+        assert!(!LarkNotesError::Other("403 forbidden".into()).is_transient());
+    }
+
+    #[test]
+    fn test_permanent_404() {
+        assert!(!LarkNotesError::Auth("404 not found".into()).is_transient());
+    }
+
+    #[test]
+    fn test_permanent_auth_variant() {
+        // Auth variant with generic message → not transient (Auth is not Cli/Sync)
+        assert!(!LarkNotesError::Auth("token expired".into()).is_transient());
+    }
+
+    #[test]
+    fn test_permanent_overrides_variant() {
+        // Even though Cli is transient by variant, "404" keyword overrides
+        assert!(!LarkNotesError::Cli("404 not found".into()).is_transient());
+    }
+
+    #[test]
+    fn test_permanent_permission() {
+        assert!(!LarkNotesError::Other("permission denied".into()).is_transient());
+    }
+
+    #[test]
+    fn test_storage_not_transient() {
+        // Storage errors are not Cli/Sync variant, so not transient unless keyword match
+        assert!(!LarkNotesError::Storage("disk full".into()).is_transient());
+    }
+
+    #[test]
+    fn test_editor_not_transient() {
+        assert!(!LarkNotesError::Editor("editor not found".into()).is_transient());
+    }
+
+    // ─── Serialize ───────────────────────────────────────
+
+    #[test]
+    fn test_serialize_cli() {
+        let err = LarkNotesError::Cli("test error".into());
+        let json: serde_json::Value = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["kind"], "cli");
+        assert_eq!(json["message"], "CLI执行失败: test error");
+    }
+
+    #[test]
+    fn test_serialize_storage() {
+        let err = LarkNotesError::Storage("db locked".into());
+        let json: serde_json::Value = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["kind"], "storage");
+        assert!(json["message"].as_str().unwrap().contains("db locked"));
+    }
+
+    #[test]
+    fn test_serialize_all_variants() {
+        let variants: Vec<(&str, LarkNotesError)> = vec![
+            ("cli", LarkNotesError::Cli("a".into())),
+            ("storage", LarkNotesError::Storage("b".into())),
+            ("sync", LarkNotesError::Sync("c".into())),
+            ("editor", LarkNotesError::Editor("d".into())),
+            ("auth", LarkNotesError::Auth("e".into())),
+            ("other", LarkNotesError::Other("f".into())),
+        ];
+        for (expected_kind, err) in variants {
+            let json: serde_json::Value = serde_json::to_value(&err).unwrap();
+            assert_eq!(json["kind"], expected_kind, "wrong kind for {err}");
+            assert!(json["message"].is_string(), "message not string for {err}");
+        }
     }
 }

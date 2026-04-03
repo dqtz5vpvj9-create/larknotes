@@ -13,6 +13,7 @@ use larknotes_provider_cli::CliProvider;
 use larknotes_storage::Storage;
 use larknotes_sync::{FileWatcher, SyncEngine, SyncEvent};
 use state::AppState;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 
 fn main() {
@@ -86,6 +87,15 @@ fn main() {
                 }
             }
 
+            // 3b. Startup path reconciliation: fix orphaned docs from
+            //     external renames while app was not running
+            {
+                let matches = larknotes_sync::reconcile_paths(&workspace_dir, &storage);
+                if !matches.is_empty() {
+                    tracing::info!("启动时修复了 {} 个孤儿文档路径", matches.len());
+                }
+            }
+
             // 4. Load config from DB
             {
                 let store = storage.lock().expect("Storage lock poisoned at init");
@@ -101,6 +111,14 @@ fn main() {
                         config.workspace_dir = p;
                     }
                 }
+                if let Ok(Some(debounce)) = store.get_config("sync_debounce_ms") {
+                    if let Ok(ms) = debounce.parse::<u64>() {
+                        config.sync_debounce_ms = ms;
+                    }
+                }
+                if let Ok(Some(auto)) = store.get_config("auto_sync") {
+                    config.auto_sync = auto == "true";
+                }
             }
             if config.editor_command == "notepad" {
                 config.editor_command = detect_editor();
@@ -113,11 +131,11 @@ fn main() {
             // 4. Read config values before wrapping in Arc
             let cli_path = config.lark_cli_path.clone();
             let editor_command = config.editor_command.clone();
-            let debounce_ms = config.sync_debounce_ms;
+            let debounce_ms = Arc::new(AtomicU64::new(config.sync_debounce_ms));
             let config = Arc::new(RwLock::new(config));
 
             // 5. Init provider
-            let provider: Arc<dyn DocProvider> = Arc::new(CliProvider::new(&cli_path));
+            let provider = Arc::new(CliProvider::new(&cli_path));
 
             // 6. Init editor
             let editor = Arc::new(RwLock::new(EditorLauncher::new(&editor_command)));
@@ -125,10 +143,10 @@ fn main() {
             // 7. Init sync channel + engine
             let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel();
             let (sync_engine, _status_rx) = SyncEngine::new(
-                provider.clone(),
+                provider.clone() as Arc<dyn DocProvider>,
                 storage.clone(),
                 workspace.clone(),
-                debounce_ms,
+                debounce_ms.clone(),
             );
             let sync_engine = Arc::new(sync_engine);
 
@@ -202,6 +220,7 @@ fn main() {
                 sync_tx,
                 config,
                 editor,
+                debounce_ms,
             });
             app.manage(ShutdownSender(Mutex::new(Some(shutdown_tx))));
 
@@ -211,6 +230,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_auth_status,
             search_docs,
+            search_docs_local,
             create_doc,
             open_doc_in_editor,
             get_doc_list,
@@ -229,6 +249,13 @@ fn main() {
             quick_note,
             get_autostart_status,
             set_autostart,
+            pull_doc,
+            set_sync_debounce,
+            set_auto_sync,
+            set_lark_cli_path,
+            open_login_url,
+            resolve_conflict,
+            get_conflict_diff,
         ])
         .build(tauri::generate_context!())
         .expect("error while building LarkNotes")

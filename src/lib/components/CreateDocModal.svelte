@@ -111,7 +111,7 @@
     transition: all var(--transition);
   }
   .field-input:focus {
-    border-color: rgba(212, 165, 71, 0.4);
+    border-color: var(--c-accent-border);
     background: var(--c-bg-hover);
   }
   .modal-actions {

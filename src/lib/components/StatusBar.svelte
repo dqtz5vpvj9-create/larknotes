@@ -72,11 +72,6 @@
   .status-label {
     color: var(--c-text-secondary);
   }
-  .status-warn {
-    color: var(--c-amber);
-    font-size: 10px;
-    margin-left: 2px;
-  }
   .status-syncing {
     color: var(--c-blue);
   }

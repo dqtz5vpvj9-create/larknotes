@@ -219,4 +219,148 @@ mod tests {
         assert_eq!(extract_title("No heading here"), "Untitled");
         assert_eq!(extract_title("## Not H1\n# Actual Title"), "Actual Title");
     }
+
+    // ─── New tests ───────────────────────────────────────
+
+    #[test]
+    fn test_sync_status_default() {
+        assert_eq!(SyncStatus::default(), SyncStatus::New);
+    }
+
+    #[test]
+    fn test_sync_status_error_serde_roundtrip() {
+        let status = SyncStatus::Error("网络异常".to_string());
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: SyncStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, status);
+    }
+
+    #[test]
+    fn test_sync_status_all_variants_serde() {
+        let variants = vec![
+            SyncStatus::Synced,
+            SyncStatus::LocalModified,
+            SyncStatus::Syncing,
+            SyncStatus::Conflict,
+            SyncStatus::Error("test".into()),
+            SyncStatus::New,
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let parsed: SyncStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, v, "roundtrip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn test_app_config_default() {
+        let cfg = AppConfig::default();
+        assert!(cfg.workspace_dir.to_string_lossy().contains("LarkNotes"));
+        assert_eq!(cfg.editor_command, "notepad");
+        assert_eq!(cfg.lark_cli_path, "lark-cli");
+        assert_eq!(cfg.sync_debounce_ms, 2000);
+        assert!(cfg.auto_sync);
+    }
+
+    #[test]
+    fn test_sanitize_filename_all_special() {
+        // 8 special chars → 8 underscores
+        assert_eq!(sanitize_filename("/:*?\"<>|"), "________");
+    }
+
+    #[test]
+    fn test_sanitize_filename_chinese() {
+        // Fullwidth colon ： is NOT ascii colon : — it passes through
+        assert_eq!(sanitize_filename("飞书笔记：测试"), "飞书笔记：测试");
+        // ASCII colon IS replaced
+        assert_eq!(sanitize_filename("飞书笔记:测试"), "飞书笔记_测试");
+    }
+
+    #[test]
+    fn test_sanitize_filename_emoji() {
+        // Emoji should pass through
+        assert_eq!(sanitize_filename("笔记📝"), "笔记📝");
+    }
+
+    #[test]
+    fn test_sanitize_filename_long_name() {
+        let long = "a".repeat(300);
+        let result = sanitize_filename(&long);
+        assert_eq!(result.len(), 300); // no truncation — filesystem will handle limits
+    }
+
+    #[test]
+    fn test_sanitize_filename_leading_trailing_spaces() {
+        assert_eq!(sanitize_filename("  hello  "), "hello");
+    }
+
+    #[test]
+    fn test_sanitize_filename_dots() {
+        assert_eq!(sanitize_filename("..."), "...");
+        assert_eq!(sanitize_filename(".hidden"), ".hidden");
+    }
+
+    #[test]
+    fn test_sanitize_filename_backslash() {
+        assert_eq!(sanitize_filename("path\\file"), "path_file");
+    }
+
+    #[test]
+    fn test_extract_title_empty() {
+        assert_eq!(extract_title(""), "Untitled");
+    }
+
+    #[test]
+    fn test_extract_title_whitespace_only() {
+        assert_eq!(extract_title("   \n\n  "), "Untitled");
+    }
+
+    #[test]
+    fn test_extract_title_h1_with_extra_spaces() {
+        assert_eq!(extract_title("#   Spaced Title  "), "Spaced Title");
+    }
+
+    #[test]
+    fn test_extract_title_multiple_h1() {
+        // First H1 wins
+        assert_eq!(extract_title("# First\n# Second"), "First");
+    }
+
+    #[test]
+    fn test_extract_title_h1_with_special_chars() {
+        assert_eq!(extract_title("# Title: 测试 & 验证"), "Title: 测试 & 验证");
+    }
+
+    #[test]
+    fn test_extract_title_h1_no_space() {
+        // "## " and "#x" don't match "# "
+        assert_eq!(extract_title("#NoSpace"), "Untitled");
+    }
+
+    #[test]
+    fn test_extract_title_h1_after_body() {
+        assert_eq!(extract_title("some text\n\n# Late Title"), "Late Title");
+    }
+
+    #[test]
+    fn test_docs_dir() {
+        assert_eq!(docs_dir(Path::new("/w")), PathBuf::from("/w/docs"));
+    }
+
+    #[test]
+    fn test_meta_dir() {
+        assert_eq!(meta_dir(Path::new("/w")), PathBuf::from("/w/.meta"));
+    }
+
+    #[test]
+    fn test_titled_content_path_special_chars() {
+        let p = titled_content_path(Path::new("/w"), "test:doc");
+        assert_eq!(p, PathBuf::from("/w/docs/test_doc.md"));
+    }
+
+    #[test]
+    fn test_titled_content_path_empty_title() {
+        let p = titled_content_path(Path::new("/w"), "");
+        assert_eq!(p, PathBuf::from("/w/docs/Untitled.md"));
+    }
 }

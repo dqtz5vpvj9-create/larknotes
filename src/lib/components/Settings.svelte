@@ -1,20 +1,33 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { setEditor, setWorkspace, detectEditors, pickFolder, getAutostartStatus, setAutostart } from "../api";
+  import {
+    setEditor, setWorkspace, detectEditors, pickFolder,
+    getAutostartStatus, setAutostart, setSyncDebounce, setAutoSync, setLarkCliPath,
+  } from "../api";
 
   interface Props {
     editorCommand: string;
     workspacePath: string;
+    syncDebounceMs: number;
+    autoSync: boolean;
+    larkCliPath: string;
     onClose: () => void;
     onEditorChange: (editor: string) => void;
     onWorkspaceChange: (path: string) => void;
+    onConfigChange: (key: string, value: unknown) => void;
     onError: (msg: string) => void;
   }
 
-  let { editorCommand, workspacePath, onClose, onEditorChange, onWorkspaceChange, onError }: Props = $props();
+  let {
+    editorCommand, workspacePath, syncDebounceMs, autoSync, larkCliPath,
+    onClose, onEditorChange, onWorkspaceChange, onConfigChange, onError,
+  }: Props = $props();
 
   let editorInput = $state("");
   let workspaceInput = $state("");
+  let debounceInput = $state(2000);
+  let autoSyncInput = $state(true);
+  let cliPathInput = $state("lark-cli");
   let detectedEditors = $state<[string, string][]>([]);
   let saving = $state(false);
   let autostartEnabled = $state(false);
@@ -22,6 +35,9 @@
 
   $effect(() => { editorInput = editorCommand; });
   $effect(() => { workspaceInput = workspacePath; });
+  $effect(() => { debounceInput = syncDebounceMs; });
+  $effect(() => { autoSyncInput = autoSync; });
+  $effect(() => { cliPathInput = larkCliPath; });
 
   onMount(async () => {
     try {
@@ -48,6 +64,10 @@
     }
   }
 
+  async function toggleAutoSync() {
+    autoSyncInput = !autoSyncInput;
+  }
+
   async function handleBrowse() {
     try {
       const path = await pickFolder();
@@ -69,6 +89,20 @@
         await setWorkspace(workspaceInput);
         onWorkspaceChange(workspaceInput);
       }
+      if (debounceInput !== syncDebounceMs) {
+        const clamped = Math.max(500, Math.min(30000, Number(debounceInput) || 2000));
+        debounceInput = clamped;
+        await setSyncDebounce(clamped);
+        onConfigChange("sync_debounce_ms", clamped);
+      }
+      if (autoSyncInput !== autoSync) {
+        await setAutoSync(autoSyncInput);
+        onConfigChange("auto_sync", autoSyncInput);
+      }
+      if (cliPathInput !== larkCliPath) {
+        await setLarkCliPath(cliPathInput);
+        onConfigChange("lark_cli_path", cliPathInput);
+      }
       onClose();
     } catch (e) {
       onError(`保存设置失败: ${e}`);
@@ -82,7 +116,11 @@
   }
 
   let hasChanges = $derived(
-    editorInput.toLowerCase() !== editorCommand.toLowerCase() || workspaceInput !== workspacePath
+    editorInput.toLowerCase() !== editorCommand.toLowerCase()
+    || workspaceInput !== workspacePath
+    || debounceInput !== syncDebounceMs
+    || autoSyncInput !== autoSync
+    || cliPathInput !== larkCliPath
   );
 </script>
 
@@ -97,6 +135,8 @@
   </div>
 
   <div class="settings-body">
+    <div class="section-label">存储</div>
+
     <div class="field">
       <label class="field-label" for="workspace-input">本地文件路径</label>
       <div class="field-row">
@@ -114,8 +154,10 @@
           浏览
         </button>
       </div>
-      <p class="field-hint">文档将保存在此目录的 docs/ 子文件夹中</p>
+      <p class="field-hint">文档将保存在此目录的 docs/ 子文件夹中（修改后需重启应用）</p>
     </div>
+
+    <div class="section-label">编辑器</div>
 
     <div class="field">
       <label class="field-label" for="editor-input">编辑器命令</label>
@@ -142,6 +184,54 @@
       <p class="field-hint">选择已安装的编辑器，或手动输入命令</p>
     </div>
 
+    <div class="section-label">同步</div>
+
+    <div class="field">
+      <div class="toggle-row">
+        <label class="field-label" for="autosync-toggle">自动同步</label>
+        <button
+          id="autosync-toggle"
+          class="toggle"
+          class:toggle--on={autoSyncInput}
+          onclick={toggleAutoSync}
+          role="switch"
+          aria-checked={autoSyncInput}
+          aria-label="自动同步"
+        >
+          <span class="toggle-knob"></span>
+        </button>
+      </div>
+      <p class="field-hint">文件修改后自动推送到飞书</p>
+    </div>
+
+    <div class="field">
+      <label class="field-label" for="debounce-input">同步延迟 (毫秒)</label>
+      <input
+        id="debounce-input"
+        type="number"
+        class="field-input"
+        bind:value={debounceInput}
+        min="500"
+        max="30000"
+        step="500"
+      />
+      <p class="field-hint">文件修改后等待多久再同步，避免频繁操作 (推荐 2000)</p>
+    </div>
+
+    <div class="section-label">高级</div>
+
+    <div class="field">
+      <label class="field-label" for="cli-path-input">Lark CLI 路径</label>
+      <input
+        id="cli-path-input"
+        type="text"
+        class="field-input"
+        bind:value={cliPathInput}
+        placeholder="lark-cli"
+      />
+      <p class="field-hint">lark-cli 命令路径，通常保持默认即可</p>
+    </div>
+
     <div class="field">
       <div class="toggle-row">
         <label class="field-label" for="autostart-toggle">开机时自动启动</label>
@@ -153,6 +243,7 @@
           disabled={autostartLoading}
           role="switch"
           aria-checked={autostartEnabled}
+          aria-label="开机自动启动"
         >
           <span class="toggle-knob"></span>
         </button>
@@ -216,10 +307,18 @@
 
   .settings-body {
     flex: 1;
-    padding: 20px;
+    padding: 16px 20px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 16px;
+  }
+  .section-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--c-text-tertiary);
+    padding-top: 4px;
   }
   .field {
     display: flex;
@@ -250,7 +349,7 @@
   }
   .field-input--grow { flex: 1; min-width: 0; }
   .field-input:focus {
-    border-color: rgba(212,165,71,0.4);
+    border-color: var(--c-accent-border, rgba(212,165,71,0.4));
     background: var(--c-bg-hover);
   }
   .field-hint {
@@ -303,6 +402,12 @@
     color: var(--c-text);
     border-color: var(--c-text-tertiary);
   }
+  .editor-chip--selected {
+    background: var(--c-accent-bg, rgba(212,165,71,0.15));
+    border-color: var(--c-accent);
+    color: var(--c-accent);
+  }
+
   .toggle-row {
     display: flex;
     align-items: center;
@@ -322,7 +427,7 @@
   }
   .toggle:hover { border-color: var(--c-text-tertiary); }
   .toggle--on {
-    background: rgba(212,165,71,0.25);
+    background: var(--c-accent-bg, rgba(212,165,71,0.25));
     border-color: var(--c-accent);
   }
   .toggle-knob {
@@ -342,12 +447,6 @@
   .toggle:disabled {
     opacity: 0.4;
     cursor: default;
-  }
-
-  .editor-chip--selected {
-    background: rgba(212,165,71,0.15);
-    border-color: var(--c-accent);
-    color: var(--c-accent);
   }
 
   .settings-footer {

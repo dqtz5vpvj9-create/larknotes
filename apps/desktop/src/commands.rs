@@ -258,16 +258,32 @@ pub async fn detect_editors() -> Result<Vec<(String, String)>, String> {
         }
     }
 
-    // 3. Always include Notepad as fallback on Windows
-    #[cfg(target_os = "windows")]
+    // 3. Check common macOS install locations
+    #[cfg(target_os = "macos")]
     {
-        if !found.iter().any(|(l, _)| l == "记事本") {
-            found.push(("记事本".to_string(), "notepad".to_string()));
+        let mac_candidates: Vec<(&str, &str)> = vec![
+            ("Typora", "/Applications/Typora.app/Contents/MacOS/Typora"),
+            ("Obsidian", "/Applications/Obsidian.app/Contents/MacOS/Obsidian"),
+            ("VS Code", "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"),
+            ("Sublime Text", "/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl"),
+        ];
+        for (label, path) in mac_candidates {
+            if found.iter().any(|(l, _)| l == label) {
+                continue;
+            }
+            if std::path::Path::new(path).exists() {
+                found.push((label.to_string(), path.to_string()));
+            }
         }
     }
 
     if found.is_empty() {
+        #[cfg(target_os = "windows")]
         found.push(("记事本".to_string(), "notepad".to_string()));
+        #[cfg(target_os = "macos")]
+        found.push(("TextEdit".to_string(), "open -a TextEdit".to_string()));
+        #[cfg(target_os = "linux")]
+        found.push(("gedit".to_string(), "gedit".to_string()));
     }
     Ok(found)
 }
@@ -357,23 +373,13 @@ pub async fn delete_doc(
     state: tauri::State<'_, AppState>,
     doc_id: String,
 ) -> Result<(), String> {
-    // Get local path before deleting from DB
-    let local_path = state
-        .storage
-        .lock()
-        .map_err(lock_err)?
-        .get_doc(&doc_id)
-        .ok()
-        .flatten()
-        .and_then(|d| d.local_path);
-
-    // Delete from DB
-    state
-        .storage
-        .lock()
-        .map_err(lock_err)?
-        .delete_doc(&doc_id)
-        .map_err(|e| e.to_string())?;
+    // Get local path and delete from DB in a single lock
+    let local_path = {
+        let store = state.storage.lock().map_err(lock_err)?;
+        let path = store.get_doc(&doc_id).ok().flatten().and_then(|d| d.local_path);
+        store.delete_doc(&doc_id).map_err(|e| e.to_string())?;
+        path
+    };
 
     // Delete local file (if exists)
     if let Some(path) = local_path {
@@ -476,7 +482,7 @@ pub async fn restore_snapshot(
 pub async fn quick_note(
     state: tauri::State<'_, AppState>,
 ) -> Result<DocMeta, String> {
-    let title = chrono::Local::now().format("笔记 %Y-%m-%d %H:%M").to_string();
+    let title = chrono::Local::now().format("笔记 %Y-%m-%d %H:%M:%S").to_string();
     let markdown = format!("# {title}\n\n");
 
     let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
@@ -538,4 +544,272 @@ pub async fn set_autostart(
     } else {
         manager.disable().map_err(|e| e.to_string())
     }
+}
+
+#[tauri::command]
+pub async fn pull_doc(
+    state: tauri::State<'_, AppState>,
+    doc_id: String,
+) -> Result<DocMeta, String> {
+    // 1. Fetch remote content
+    let content = state
+        .provider
+        .fetch_doc(&doc_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 2. Get local doc info
+    let mut meta = state
+        .storage
+        .lock()
+        .map_err(lock_err)?
+        .get_doc(&doc_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "文档不存在".to_string())?;
+
+    let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
+
+    // 3. Determine local file path — rename if title changed
+    let old_local_path = meta.local_path
+        .as_ref()
+        .map(std::path::PathBuf::from);
+
+    std::fs::create_dir_all(larknotes_core::docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
+
+    let new_title = larknotes_core::extract_title(&content);
+    let ideal_path = larknotes_core::unique_content_path(&workspace_dir, &new_title);
+
+    // If we have an existing file and the title changed, rename it
+    let local_path = match &old_local_path {
+        Some(old) if old.exists() && *old != ideal_path => {
+            // Rename file to match new title
+            if let Err(e) = std::fs::rename(old, &ideal_path) {
+                tracing::warn!("pull_doc: 重命名文件失败 {} → {}: {e}", old.display(), ideal_path.display());
+                old.clone() // Keep old path if rename fails
+            } else {
+                tracing::info!("pull_doc: 文件已重命名 {} → {}", old.display(), ideal_path.display());
+                ideal_path
+            }
+        }
+        Some(old) if old.exists() => old.clone(), // Title unchanged, keep path
+        _ => ideal_path, // No existing file, use ideal path
+    };
+
+    // 4. Update DB BEFORE writing file — this prevents the file watcher from
+    //    seeing the change and pushing it back to remote (sync_one checks hash).
+    let hash = hash_content(content.as_bytes());
+    meta.local_path = Some(local_path.to_string_lossy().to_string());
+    meta.content_hash = Some(hash.clone());
+    meta.sync_status = SyncStatus::Synced;
+    meta.title = new_title;
+
+    {
+        let store = state.storage.lock().map_err(lock_err)?;
+        store.upsert_doc(&meta).map_err(|e| e.to_string())?;
+        store.add_sync_history(&doc_id, "pull", Some(&hash)).map_err(|e| e.to_string())?;
+        store.save_snapshot(&doc_id, &content, &hash).map_err(|e| e.to_string())?;
+    }
+
+    // Write file AFTER DB is updated so watcher sees matching hash and skips
+    std::fs::write(&local_path, &content).map_err(|e| e.to_string())?;
+
+    Ok(meta)
+}
+
+#[tauri::command]
+pub async fn search_docs_local(
+    state: tauri::State<'_, AppState>,
+    query: String,
+) -> Result<Vec<DocMeta>, String> {
+    state
+        .storage
+        .lock()
+        .map_err(lock_err)?
+        .search_docs_local(&query)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_sync_debounce(
+    state: tauri::State<'_, AppState>,
+    ms: u64,
+) -> Result<(), String> {
+    state.config.write().map_err(lock_err)?.sync_debounce_ms = ms;
+    // Update the running sync engine's debounce immediately
+    state.debounce_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    state
+        .storage
+        .lock()
+        .map_err(lock_err)?
+        .set_config("sync_debounce_ms", &ms.to_string())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_auto_sync(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.config.write().map_err(lock_err)?.auto_sync = enabled;
+    state
+        .storage
+        .lock()
+        .map_err(lock_err)?
+        .set_config("auto_sync", if enabled { "true" } else { "false" })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_lark_cli_path(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    state.config.write().map_err(lock_err)?.lark_cli_path = path.clone();
+    // Update the running CLI provider immediately
+    state.provider.set_cli_path(&path);
+    state
+        .storage
+        .lock()
+        .map_err(lock_err)?
+        .set_config("lark_cli_path", &path)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn open_login_url(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let cli_path = state.config.read().map_err(lock_err)?.lark_cli_path.clone();
+    // Return the command the user needs to run
+    Ok(format!("{} auth login", cli_path))
+}
+
+#[tauri::command]
+pub async fn resolve_conflict(
+    state: tauri::State<'_, AppState>,
+    doc_id: String,
+    resolution: String,  // "keep_local" or "keep_remote"
+) -> Result<DocMeta, String> {
+    if resolution == "keep_remote" {
+        // Pull remote content and overwrite local
+        let content = state
+            .provider
+            .fetch_doc(&doc_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut meta = state
+            .storage
+            .lock()
+            .map_err(lock_err)?
+            .get_doc(&doc_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "文档不存在".to_string())?;
+
+        let old_local_path = meta.local_path
+            .as_ref()
+            .ok_or_else(|| "本地文件路径不存在，无法写入".to_string())?
+            .clone();
+
+        // Rename file if remote title changed
+        let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
+        let new_title = larknotes_core::extract_title(&content);
+        let ideal_path = larknotes_core::unique_content_path(&workspace_dir, &new_title);
+        let old_path = std::path::PathBuf::from(&old_local_path);
+
+        let local_path = if old_path.exists() && old_path != ideal_path {
+            match std::fs::rename(&old_path, &ideal_path) {
+                Ok(()) => {
+                    tracing::info!("resolve_conflict: 文件已重命名 {} → {}", old_path.display(), ideal_path.display());
+                    ideal_path
+                }
+                Err(e) => {
+                    tracing::warn!("resolve_conflict: 重命名文件失败: {e}");
+                    old_path
+                }
+            }
+        } else {
+            old_path
+        };
+
+        // Update DB BEFORE writing file to prevent watcher push-back
+        let hash = hash_content(content.as_bytes());
+        meta.local_path = Some(local_path.to_string_lossy().to_string());
+        meta.content_hash = Some(hash.clone());
+        meta.sync_status = SyncStatus::Synced;
+        meta.title = new_title;
+
+        {
+            let store = state.storage.lock().map_err(lock_err)?;
+            store.upsert_doc(&meta).map_err(|e| e.to_string())?;
+            store.add_sync_history(&doc_id, "pull", Some(&hash)).map_err(|e| e.to_string())?;
+            store.save_snapshot(&doc_id, &content, &hash).map_err(|e| e.to_string())?;
+        }
+
+        std::fs::write(&local_path, &content).map_err(|e| e.to_string())?;
+
+        Ok(meta)
+    } else {
+        // keep_local: push local content to remote
+        let meta = state
+            .storage
+            .lock()
+            .map_err(lock_err)?
+            .get_doc(&doc_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "文档不存在".to_string())?;
+
+        let local_path = meta.local_path
+            .as_ref()
+            .ok_or_else(|| "本地文件不存在".to_string())?;
+
+        let content = std::fs::read_to_string(local_path).map_err(|e| e.to_string())?;
+
+        state
+            .provider
+            .update_doc(&doc_id, &content)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let hash = hash_content(content.as_bytes());
+        let mut meta = meta;
+        meta.content_hash = Some(hash.clone());
+        meta.sync_status = SyncStatus::Synced;
+
+        let store = state.storage.lock().map_err(lock_err)?;
+        store.upsert_doc(&meta).map_err(|e| e.to_string())?;
+        store.add_sync_history(&doc_id, "push", Some(&hash)).map_err(|e| e.to_string())?;
+        store.save_snapshot(&doc_id, &content, &hash).map_err(|e| e.to_string())?;
+
+        Ok(meta)
+    }
+}
+
+#[tauri::command]
+pub async fn get_conflict_diff(
+    state: tauri::State<'_, AppState>,
+    doc_id: String,
+) -> Result<(String, String), String> {
+    // Get local content
+    let meta = state
+        .storage
+        .lock()
+        .map_err(lock_err)?
+        .get_doc(&doc_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "文档不存在".to_string())?;
+
+    let local_content = match &meta.local_path {
+        Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
+        None => String::new(),
+    };
+
+    // Get remote content
+    let remote_content = state
+        .provider
+        .fetch_doc(&doc_id)
+        .await
+        .unwrap_or_default();
+
+    Ok((local_content, remote_content))
 }

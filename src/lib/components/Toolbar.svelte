@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { searchDocs, getDocList } from "../api";
+  import { onDestroy } from "svelte";
+  import { searchDocsLocal, searchDocs, getDocList } from "../api";
   import type { DocMeta } from "../types";
 
   interface Props {
@@ -19,18 +20,27 @@
   let searchQuery = $state("");
   let searchFocused = $state(false);
   let searchTimeout: ReturnType<typeof setTimeout> | null = null;
+  let searchMode = $state<"local" | "remote">("local");
+
+  onDestroy(() => {
+    if (searchTimeout) clearTimeout(searchTimeout);
+  });
 
   function handleSearch() {
     if (searchTimeout) clearTimeout(searchTimeout);
     onSearchQueryChange?.(searchQuery.trim());
     searchTimeout = setTimeout(async () => {
       try {
-        if (searchQuery.trim()) {
-          const results = await searchDocs(searchQuery.trim());
-          onDocsUpdate(results);
-        } else {
+        const q = searchQuery.trim();
+        if (!q) {
           const docs = await getDocList();
           onDocsUpdate(docs);
+        } else if (searchMode === "local") {
+          const results = await searchDocsLocal(q);
+          onDocsUpdate(results);
+        } else {
+          const results = await searchDocs(q);
+          onDocsUpdate(results);
         }
       } catch (e) {
         onError(`搜索失败: ${e}`);
@@ -42,6 +52,13 @@
     searchQuery = "";
     onSearchQueryChange?.("");
     handleSearch();
+  }
+
+  function toggleSearchMode() {
+    searchMode = searchMode === "local" ? "remote" : "local";
+    if (searchQuery.trim()) {
+      handleSearch();
+    }
   }
 
   async function handleRefresh() {
@@ -57,29 +74,25 @@
 </script>
 
 <div class="toolbar" data-tauri-drag-region>
-  <div class="toolbar-brand" data-tauri-drag-region>
-    <span class="brand-name">LarkNotes</span>
-  </div>
-
   <div class="toolbar-left">
     <button
       class="create-btn"
-      onclick={onShowCreate}
-      title="新建文档 (Ctrl+N)"
-    >
-      <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-        <path d="M7 1.5v11M1.5 7h11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-      </svg>
-      <span>新建</span>
-    </button>
-    <button
-      class="tool-btn"
       onclick={onQuickNote}
-      title="快速笔记 (Ctrl+Shift+N)"
+      title="快速笔记 (Ctrl+N)"
     >
       <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
         <path d="M4 2h8a1 1 0 011 1v10a1 1 0 01-1 1H4a1 1 0 01-1-1V3a1 1 0 011-1z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
         <path d="M5.5 5.5h5M5.5 8h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+      </svg>
+      <span>快速笔记</span>
+    </button>
+    <button
+      class="tool-btn"
+      onclick={onShowCreate}
+      title="新建文档 (Ctrl+Shift+N)"
+    >
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+        <path d="M7 1.5v11M1.5 7h11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
       </svg>
     </button>
   </div>
@@ -91,12 +104,20 @@
     </svg>
     <input
       type="text"
-      placeholder={searchFocused ? "搜索文档..." : "搜索  Ctrl+K"}
+      placeholder={searchFocused ? `搜索${searchMode === "local" ? "本地" : "飞书"}文档...` : "搜索  Ctrl+K"}
       bind:value={searchQuery}
       oninput={handleSearch}
       onfocus={() => searchFocused = true}
       onblur={() => searchFocused = false}
     />
+    <button
+      class="search-mode-btn"
+      class:search-mode-btn--remote={searchMode === "remote"}
+      onclick={toggleSearchMode}
+      title={searchMode === "local" ? "切换到飞书搜索" : "切换到本地搜索"}
+    >
+      {searchMode === "local" ? "本地" : "飞书"}
+    </button>
     {#if searchQuery}
       <button class="search-clear" onclick={clearSearch} title="清除">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
@@ -149,17 +170,6 @@
     background: var(--c-bg);
     flex-shrink: 0;
   }
-  .toolbar-brand {
-    flex-shrink: 0;
-    margin-right: 4px;
-  }
-  .brand-name {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--c-text-secondary);
-    letter-spacing: -0.02em;
-    pointer-events: none;
-  }
   .toolbar-left { flex-shrink: 0; }
   .toolbar-right { display: flex; gap: 2px; flex-shrink: 0; }
 
@@ -196,7 +206,7 @@
     transition: all var(--transition);
   }
   .search-wrapper.focused {
-    border-color: rgba(212,165,71,0.3);
+    border-color: var(--c-accent-border, rgba(212,165,71,0.3));
     background: var(--c-bg-hover);
   }
   .search-icon {
@@ -211,6 +221,27 @@
     font-size: 13px;
     color: var(--c-text);
     font-family: var(--font-sans);
+  }
+  .search-mode-btn {
+    flex-shrink: 0;
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--c-border);
+    background: transparent;
+    color: var(--c-text-tertiary);
+    font-size: 10px;
+    font-family: var(--font-sans);
+    cursor: pointer;
+    transition: all var(--transition);
+  }
+  .search-mode-btn:hover {
+    color: var(--c-text-secondary);
+    border-color: var(--c-text-tertiary);
+  }
+  .search-mode-btn--remote {
+    color: var(--c-blue);
+    border-color: var(--c-blue);
+    background: rgba(91,159,212,0.1);
   }
   .search-clear {
     display: flex;
@@ -255,6 +286,6 @@
   }
   .tool-btn--active {
     color: var(--c-accent) !important;
-    background: rgba(212,165,71,0.1) !important;
+    background: var(--c-accent-bg, rgba(212,165,71,0.1)) !important;
   }
 </style>

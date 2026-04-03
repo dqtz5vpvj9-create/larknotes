@@ -56,6 +56,9 @@ export interface VersionSnapshot {
   created_at: string;
 }
 
+export type SortField = "updated_at" | "title" | "sync_status";
+export type SortDirection = "asc" | "desc";
+
 export function syncStatusLabel(status: SyncStatus): string {
   switch (status.type) {
     case "Synced":
@@ -73,19 +76,87 @@ export function syncStatusLabel(status: SyncStatus): string {
   }
 }
 
-export function syncStatusBadge(status: SyncStatus): string {
-  switch (status.type) {
-    case "Synced":
-      return "badge-synced";
-    case "Syncing":
-      return "badge-syncing";
-    case "LocalModified":
-      return "badge-modified";
-    case "Conflict":
-      return "badge-conflict";
-    case "Error":
-      return "badge-error";
-    default:
-      return "badge-synced";
+export function syncStatusColor(type: string): string {
+  switch (type) {
+    case "Synced": return "var(--c-green)";
+    case "Syncing": return "var(--c-blue)";
+    case "LocalModified": return "var(--c-amber)";
+    case "Conflict": return "var(--c-red)";
+    case "Error": return "var(--c-red)";
+    default: return "var(--c-text-tertiary)";
   }
+}
+
+/** Sort priority for sync status (lower = higher priority) */
+function syncStatusPriority(type: string): number {
+  switch (type) {
+    case "Conflict": return 0;
+    case "Error": return 1;
+    case "Syncing": return 2;
+    case "LocalModified": return 3;
+    case "New": return 4;
+    case "Synced": return 5;
+    default: return 6;
+  }
+}
+
+export function sortDocs(
+  docs: DocMeta[],
+  field: SortField,
+  direction: SortDirection,
+): DocMeta[] {
+  return [...docs].sort((a, b) => {
+    let cmp = 0;
+    switch (field) {
+      case "title":
+        cmp = (a.title || "").localeCompare(b.title || "", "zh-CN");
+        break;
+      case "updated_at":
+        cmp = (a.updated_at || "").localeCompare(b.updated_at || "");
+        break;
+      case "sync_status":
+        cmp = syncStatusPriority(a.sync_status.type) - syncStatusPriority(b.sync_status.type);
+        break;
+    }
+    return direction === "asc" ? cmp : -cmp;
+  });
+}
+
+export function formatRelativeTime(iso: string): string {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const diff = now.getTime() - d.getTime();
+    if (diff < 60_000) return "刚刚";
+    if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+    if (diff < 86400_000) {
+      const yesterday = new Date(now);
+      yesterday.setDate(yesterday.getDate() - 1);
+      if (d.toDateString() === yesterday.toDateString()) return "昨天";
+      return `${Math.floor(diff / 3600_000)} 小时前`;
+    }
+    if (diff < 604800_000) return `${Math.floor(diff / 86400_000)} 天前`;
+    return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+/** Split text into segments for highlight rendering */
+export function highlightSegments(text: string, query: string): { text: string; match: boolean }[] {
+  if (!query) return [{ text, match: false }];
+  const lower = text.toLowerCase();
+  const qLower = query.toLowerCase();
+  const segments: { text: string; match: boolean }[] = [];
+  let lastIndex = 0;
+  let idx = lower.indexOf(qLower);
+  while (idx !== -1) {
+    if (idx > lastIndex) segments.push({ text: text.slice(lastIndex, idx), match: false });
+    segments.push({ text: text.slice(idx, idx + query.length), match: true });
+    lastIndex = idx + query.length;
+    idx = lower.indexOf(qLower, lastIndex);
+  }
+  if (lastIndex < text.length) segments.push({ text: text.slice(lastIndex), match: false });
+  return segments.length ? segments : [{ text, match: false }];
 }

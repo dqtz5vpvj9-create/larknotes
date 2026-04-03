@@ -3,13 +3,14 @@ use larknotes_core::*;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::RwLock;
 use tokio::process::Command;
 
 pub struct CliProvider {
-    cli_path: String,
+    cli_path: RwLock<String>,
     /// On Windows, resolved node.exe + script path to bypass cmd.exe arg mangling
     #[cfg(windows)]
-    resolved: Option<(PathBuf, PathBuf)>,
+    resolved: RwLock<Option<(PathBuf, PathBuf)>>,
 }
 
 #[cfg(windows)]
@@ -65,19 +66,37 @@ impl CliProvider {
         let resolved = resolve_cmd_shim(cli_path);
 
         Self {
-            cli_path: cli_path.to_string(),
+            cli_path: RwLock::new(cli_path.to_string()),
             #[cfg(windows)]
-            resolved,
+            resolved: RwLock::new(resolved),
+        }
+    }
+
+    /// Update the CLI path at runtime (e.g. when user changes settings).
+    pub fn set_cli_path(&self, path: &str) {
+        if let Ok(mut cli_path) = self.cli_path.write() {
+            *cli_path = path.to_string();
+        }
+        #[cfg(windows)]
+        if let Ok(mut resolved) = self.resolved.write() {
+            *resolved = resolve_cmd_shim(path);
         }
     }
 
     async fn run_cli(&self, args: &[&str]) -> Result<serde_json::Value, LarkNotesError> {
+        let cli_path = self.cli_path.read()
+            .map_err(|e| LarkNotesError::Cli(format!("Lock error: {e}")))?
+            .clone();
+
         tracing::debug!("lark-cli {}", args.join(" "));
 
         // On Windows, call node directly to avoid cmd.exe mangling multiline args
         #[cfg(windows)]
         let output = {
-            if let Some((node_path, script_path)) = &self.resolved {
+            let resolved = self.resolved.read()
+                .map_err(|e| LarkNotesError::Cli(format!("Lock error: {e}")))?
+                .clone();
+            if let Some((node_path, script_path)) = &resolved {
                 let mut cmd = Command::new(node_path);
                 cmd.arg(script_path)
                     .args(args)
@@ -89,7 +108,7 @@ impl CliProvider {
                     .map_err(|e| LarkNotesError::Cli(format!("启动lark-cli失败: {e}")))?
             } else {
                 // Fallback to cmd /C for simple commands
-                let mut cmd_args = vec!["/C", &self.cli_path as &str];
+                let mut cmd_args = vec!["/C", &cli_path as &str];
                 cmd_args.extend_from_slice(args);
                 Command::new("cmd")
                     .args(&cmd_args)
@@ -103,7 +122,7 @@ impl CliProvider {
         };
 
         #[cfg(not(windows))]
-        let output = Command::new(&self.cli_path)
+        let output = Command::new(&cli_path)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -524,6 +543,126 @@ mod tests {
 
         let md = parse_fetch_response(&json);
         assert_eq!(md, "");
+    }
+
+    // ========== unescape_markdown tests ===========
+
+    #[test]
+    fn test_unescape_markdown_stars() {
+        assert_eq!(unescape_markdown(r"\*\*bold\*\*"), "**bold**");
+    }
+
+    #[test]
+    fn test_unescape_markdown_tilde() {
+        assert_eq!(unescape_markdown(r"\~\~strike\~\~"), "~~strike~~");
+    }
+
+    #[test]
+    fn test_unescape_markdown_backtick() {
+        assert_eq!(unescape_markdown(r"\`code\`"), "`code`");
+    }
+
+    #[test]
+    fn test_unescape_markdown_brackets() {
+        assert_eq!(unescape_markdown(r"\[link\]"), "[link]");
+    }
+
+    #[test]
+    fn test_unescape_markdown_hash() {
+        assert_eq!(unescape_markdown(r"\# Heading"), "# Heading");
+    }
+
+    #[test]
+    fn test_unescape_markdown_all_escapes() {
+        let input = r"\*\~\`\[\]\#\>\-\_";
+        let expected = "*~`[]#>-_";
+        assert_eq!(unescape_markdown(input), expected);
+    }
+
+    #[test]
+    fn test_unescape_markdown_no_escapes() {
+        assert_eq!(unescape_markdown("plain text"), "plain text");
+        assert_eq!(unescape_markdown(""), "");
+    }
+
+    #[test]
+    fn test_unescape_markdown_mixed_content() {
+        let input = r"# Hello \*\*World\*\*\n\nSome \`code\` here";
+        let expected = "# Hello **World**\\n\\nSome `code` here";
+        assert_eq!(unescape_markdown(input), expected);
+    }
+
+    // ========== parse edge cases ===========
+
+    #[test]
+    fn test_parse_search_results_missing_title() {
+        // No title_highlighted → fallback to "Untitled"
+        let json: serde_json::Value = serde_json::from_str(r#"{
+            "ok": true,
+            "data": {
+                "results": [{
+                    "result_meta": { "token": "doc1", "url": "", "owner_name": "", "doc_types": "DOCX", "create_time_iso": "", "update_time_iso": "" }
+                }]
+            }
+        }"#).unwrap();
+
+        let docs = parse_search_results(&json);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].title, "Untitled");
+    }
+
+    #[test]
+    fn test_parse_search_results_minimal_meta() {
+        // result_meta with only token
+        let json: serde_json::Value = serde_json::from_str(r#"{
+            "ok": true,
+            "data": {
+                "results": [{
+                    "result_meta": { "token": "abc" },
+                    "title_highlighted": "Test"
+                }]
+            }
+        }"#).unwrap();
+
+        let docs = parse_search_results(&json);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].doc_id, "abc");
+        assert_eq!(docs[0].url, "");
+        assert_eq!(docs[0].owner_name, "");
+    }
+
+    #[test]
+    fn test_parse_create_response_missing_url() {
+        let json: serde_json::Value = serde_json::from_str(r#"{
+            "ok": true,
+            "data": { "doc_id": "xyz" }
+        }"#).unwrap();
+
+        let meta = parse_create_response(&json, "Test").unwrap();
+        assert_eq!(meta.doc_id, "xyz");
+        assert_eq!(meta.url, ""); // Missing url defaults to empty
+    }
+
+    #[test]
+    fn test_parse_fetch_response_escaped_markdown() {
+        let json: serde_json::Value = serde_json::from_str(r#"{
+            "ok": true,
+            "data": { "markdown": "\\*\\*bold\\*\\*" }
+        }"#).unwrap();
+
+        let md = parse_fetch_response(&json);
+        assert_eq!(md, "**bold**"); // Should be unescaped
+    }
+
+    // ========== set_cli_path tests ===========
+
+    #[test]
+    fn test_set_cli_path_updates_path() {
+        let provider = CliProvider::new("lark-cli");
+        assert_eq!(*provider.cli_path.read().unwrap(), "lark-cli");
+
+        provider.set_cli_path("/usr/local/bin/lark-cli");
+        assert_eq!(*provider.cli_path.read().unwrap(), "/usr/local/bin/lark-cli");
     }
 
     // ========== Live integration tests (require lark-cli auth) ==========

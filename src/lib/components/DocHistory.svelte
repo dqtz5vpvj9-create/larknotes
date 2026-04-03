@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getSyncHistory } from "../api";
+  import { formatRelativeTime } from "../types";
   import type { SyncHistoryEntry } from "../types";
 
   interface Props {
@@ -61,22 +62,6 @@
     }
   }
 
-  function formatTime(iso: string): string {
-    if (!iso) return "";
-    try {
-      const d = new Date(iso);
-      const now = new Date();
-      const diff = now.getTime() - d.getTime();
-      if (diff < 60_000) return "刚刚";
-      if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
-      if (diff < 86400_000) return `${Math.floor(diff / 3600_000)} 小时前`;
-      if (diff < 604800_000) return `${Math.floor(diff / 86400_000)} 天前`;
-      return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-    } catch {
-      return "";
-    }
-  }
-
   function shortHash(hash: string | null): string {
     if (!hash) return "";
     return hash.slice(0, 8);
@@ -134,7 +119,7 @@
                   <span class="tl-action" style="color: {actionColor(entry.action)};">
                     {actionLabel(entry.action)}
                   </span>
-                  <span class="tl-time">{formatTime(entry.created_at)}</span>
+                  <span class="tl-time">{formatRelativeTime(entry.created_at)}</span>
                 </div>
                 {#if entry.content_hash}
                   <code class="tl-hash">{shortHash(entry.content_hash)}</code>

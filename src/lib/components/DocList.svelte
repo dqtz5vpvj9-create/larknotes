@@ -1,7 +1,7 @@
 <script lang="ts">
   import { openDocInEditor } from "../api";
-  import { syncStatusLabel } from "../types";
-  import type { DocMeta } from "../types";
+  import { syncStatusLabel, syncStatusColor, highlightSegments, formatRelativeTime, sortDocs } from "../types";
+  import type { DocMeta, SortField, SortDirection } from "../types";
   import ContextMenu from "./ContextMenu.svelte";
 
   interface Props {
@@ -9,16 +9,34 @@
     searchQuery?: string;
     onError: (msg: string) => void;
     onSync: (docId: string) => void;
+    onPull?: (docId: string) => void;
     onImport?: (docId: string) => void;
     onDelete?: (docId: string) => void;
     onReveal?: (docId: string) => void;
     onShowHistory?: (docId: string) => void;
+    onResolveConflict?: (docId: string) => void;
   }
 
-  let { docs, searchQuery = "", onError, onSync, onImport, onDelete, onReveal, onShowHistory }: Props = $props();
+  let {
+    docs, searchQuery = "", onError, onSync, onPull, onImport,
+    onDelete, onReveal, onShowHistory, onResolveConflict,
+  }: Props = $props();
 
   let openingId = $state<string | null>(null);
   let contextMenu = $state<{ x: number; y: number; doc: DocMeta } | null>(null);
+  let sortField = $state<SortField>("updated_at");
+  let sortDirection = $state<SortDirection>("desc");
+
+  let sortedDocs = $derived(sortDocs(docs, sortField, sortDirection));
+
+  function toggleSort(field: SortField) {
+    if (sortField === field) {
+      sortDirection = sortDirection === "desc" ? "asc" : "desc";
+    } else {
+      sortField = field;
+      sortDirection = field === "title" ? "asc" : "desc";
+    }
+  }
 
   async function handleOpen(doc: DocMeta) {
     if (openingId) return;
@@ -30,10 +48,6 @@
     } finally {
       openingId = null;
     }
-  }
-
-  function handleSync(doc: DocMeta) {
-    onSync(doc.doc_id);
   }
 
   function handleContextMenu(e: MouseEvent, doc: DocMeta) {
@@ -58,13 +72,24 @@
       });
     }
     items.push({
-      label: "手动同步",
+      label: "推送到远程",
       action: () => onSync(doc.doc_id),
       separator: true,
     });
     items.push({
+      label: "从远程拉取",
+      action: () => onPull?.(doc.doc_id),
+    });
+    if (doc.sync_status.type === "Conflict") {
+      items.push({
+        label: "解决冲突",
+        action: () => onResolveConflict?.(doc.doc_id),
+      });
+    }
+    items.push({
       label: "查看历史",
       action: () => onShowHistory?.(doc.doc_id),
+      separator: true,
     });
     items.push({
       label: "删除",
@@ -75,37 +100,6 @@
     return items;
   }
 
-  function formatTime(iso: string): string {
-    if (!iso) return "";
-    try {
-      const d = new Date(iso);
-      const now = new Date();
-      const diff = now.getTime() - d.getTime();
-      if (diff < 60_000) return "刚刚";
-      if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
-      if (diff < 86400_000) {
-        const yesterday = new Date(now);
-        yesterday.setDate(yesterday.getDate() - 1);
-        if (d.toDateString() === yesterday.toDateString()) return "昨天";
-        return `${Math.floor(diff / 3600_000)} 小时前`;
-      }
-      return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
-    } catch {
-      return "";
-    }
-  }
-
-  function statusColor(type: string): string {
-    switch (type) {
-      case "Synced": return "var(--c-green)";
-      case "Syncing": return "var(--c-blue)";
-      case "LocalModified": return "var(--c-amber)";
-      case "Conflict": return "var(--c-red)";
-      case "Error": return "var(--c-red)";
-      default: return "var(--c-text-tertiary)";
-    }
-  }
-
   function isWarning(type: string): boolean {
     return type === "Conflict" || type === "Error";
   }
@@ -114,31 +108,14 @@
     return Math.min(i * 25, 250);
   }
 
-  /** Split text into segments: [{text, match}] for highlight rendering */
-  function highlightSegments(text: string, query: string): { text: string; match: boolean }[] {
-    if (!query) return [{ text, match: false }];
-    const lower = text.toLowerCase();
-    const qLower = query.toLowerCase();
-    const segments: { text: string; match: boolean }[] = [];
-    let lastIndex = 0;
-    let idx = lower.indexOf(qLower);
-    while (idx !== -1) {
-      if (idx > lastIndex) {
-        segments.push({ text: text.slice(lastIndex, idx), match: false });
-      }
-      segments.push({ text: text.slice(idx, idx + query.length), match: true });
-      lastIndex = idx + query.length;
-      idx = lower.indexOf(qLower, lastIndex);
-    }
-    if (lastIndex < text.length) {
-      segments.push({ text: text.slice(lastIndex), match: false });
-    }
-    return segments.length ? segments : [{ text, match: false }];
+  function sortArrow(field: SortField): string {
+    if (sortField !== field) return "";
+    return sortDirection === "asc" ? " \u2191" : " \u2193";
   }
 </script>
 
 <div class="doc-list">
-  {#if docs.length === 0}
+  {#if docs.length === 0 && !searchQuery}
     <div class="empty-state">
       <div class="empty-illustration">
         <svg width="64" height="64" viewBox="0 0 64 64" fill="none">
@@ -151,13 +128,32 @@
       </div>
       <p class="empty-title">还没有文档</p>
       <p class="empty-hint">点击上方 <kbd class="empty-kbd">+ 新建</kbd> 或按 <kbd class="empty-kbd">Ctrl+N</kbd> 创建第一篇</p>
+      <p class="empty-hint">也可以使用搜索功能从飞书导入已有文档</p>
+    </div>
+  {:else if docs.length === 0 && searchQuery}
+    <div class="empty-state">
+      <p class="empty-title">没有找到匹配的文档</p>
+      <p class="empty-hint">试试其他关键词</p>
     </div>
   {:else}
-    {#if searchQuery}
-      <div class="search-count">找到 {docs.length} 篇文档</div>
-    {/if}
+    <div class="list-header">
+      {#if searchQuery}
+        <span class="search-count">找到 {docs.length} 篇文档</span>
+      {/if}
+      <div class="sort-bar">
+        <button class="sort-btn" class:sort-btn--active={sortField === "updated_at"} onclick={() => toggleSort("updated_at")}>
+          时间{sortArrow("updated_at")}
+        </button>
+        <button class="sort-btn" class:sort-btn--active={sortField === "title"} onclick={() => toggleSort("title")}>
+          标题{sortArrow("title")}
+        </button>
+        <button class="sort-btn" class:sort-btn--active={sortField === "sync_status"} onclick={() => toggleSort("sync_status")}>
+          状态{sortArrow("sync_status")}
+        </button>
+      </div>
+    </div>
     <div class="list">
-      {#each docs as doc, i (doc.doc_id)}
+      {#each sortedDocs as doc, i (doc.doc_id)}
         <div
           class="doc-row"
           class:doc-row--warn={isWarning(doc.sync_status.type)}
@@ -170,10 +166,10 @@
           style="animation-delay: {animDelay(i)}ms"
         >
           {#if isWarning(doc.sync_status.type)}
-            <div class="doc-accent-bar" style="background: {statusColor(doc.sync_status.type)};"></div>
+            <div class="doc-accent-bar" style="background: {syncStatusColor(doc.sync_status.type)};"></div>
           {/if}
 
-          <div class="doc-status-dot" style="background: {statusColor(doc.sync_status.type)};"></div>
+          <div class="doc-status-dot" style="background: {syncStatusColor(doc.sync_status.type)};"></div>
 
           <div class="doc-info">
             <span class="doc-title">
@@ -186,20 +182,20 @@
               {/if}
             </span>
             <span class="doc-meta">
-              {#if doc.owner_name}{doc.owner_name} · {/if}{formatTime(doc.updated_at)}
+              {#if doc.owner_name}{doc.owner_name} · {/if}{formatRelativeTime(doc.updated_at)}
             </span>
           </div>
 
           <div class="doc-badge">
-            <span class="badge" style="color: {statusColor(doc.sync_status.type)};">
+            <span class="badge" style="color: {syncStatusColor(doc.sync_status.type)};">
               {syncStatusLabel(doc.sync_status)}
             </span>
           </div>
 
           <button
             class="doc-action"
-            onclick={(e: MouseEvent) => { e.stopPropagation(); handleSync(doc); }}
-            title="手动同步"
+            onclick={(e: MouseEvent) => { e.stopPropagation(); onSync(doc.doc_id); }}
+            title="推送同步"
           >
             <svg width="14" height="14" viewBox="0 0 15 15" fill="none">
               <path d="M2.5 7.5a5 5 0 019-3M12.5 7.5a5 5 0 01-9 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
@@ -257,12 +253,50 @@
     gap: 3px;
     padding: 1px 8px;
     border-radius: var(--radius-sm);
-    background: rgba(212,165,71,0.1);
+    background: var(--c-accent-bg, rgba(212,165,71,0.1));
     color: var(--c-accent);
     font-weight: 500;
     font-size: 11px;
     font-family: var(--font-sans);
-    border: 1px solid rgba(212,165,71,0.15);
+    border: 1px solid var(--c-accent-border, rgba(212,165,71,0.15));
+  }
+
+  /* List header / sort bar */
+  .list-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 10px 2px;
+  }
+  .search-count {
+    font-size: 11px;
+    color: var(--c-text-tertiary);
+    letter-spacing: 0.02em;
+  }
+  .sort-bar {
+    display: flex;
+    gap: 2px;
+    margin-left: auto;
+  }
+  .sort-btn {
+    padding: 2px 8px;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--c-text-tertiary);
+    font-size: 11px;
+    font-family: var(--font-sans);
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: all var(--transition);
+  }
+  .sort-btn:hover {
+    color: var(--c-text-secondary);
+    background: var(--c-bg-hover);
+  }
+  .sort-btn--active {
+    color: var(--c-accent);
+    font-weight: 600;
   }
 
   /* List */
@@ -373,15 +407,8 @@
     color: var(--c-text);
   }
 
-  .search-count {
-    padding: 4px 12px 2px;
-    font-size: 11px;
-    color: var(--c-text-tertiary);
-    letter-spacing: 0.02em;
-  }
-
   .highlight {
-    background: rgba(212,165,71,0.25);
+    background: var(--c-accent-bg, rgba(212,165,71,0.25));
     color: var(--c-accent);
     border-radius: 2px;
     padding: 0 1px;

@@ -1,7 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { getAuthStatus, getDocList, getAppConfig, createDoc, manualSync, importDoc, deleteDoc, revealInExplorer, openDocInEditor, quickNote } from "./lib/api";
+  import {
+    getAuthStatus, getDocList, getAppConfig, createDoc, manualSync,
+    importDoc, deleteDoc, revealInExplorer, openDocInEditor, quickNote,
+    pullDoc,
+  } from "./lib/api";
   import type { AuthStatus, DocMeta, AppConfig, SyncStatusUpdate } from "./lib/types";
   import Toolbar from "./lib/components/Toolbar.svelte";
   import DocList from "./lib/components/DocList.svelte";
@@ -12,30 +16,17 @@
   import ConfirmDialog from "./lib/components/ConfirmDialog.svelte";
   import DocHistory from "./lib/components/DocHistory.svelte";
   import CommandPalette from "./lib/components/CommandPalette.svelte";
+  import ConflictResolver from "./lib/components/ConflictResolver.svelte";
 
+  // ─── Toast system ──────────────────────────────────
   interface ToastMessage {
     id: number;
     text: string;
     type: "error" | "success" | "info";
   }
 
-  let loading = $state(true);
-  let auth = $state<AuthStatus | null>(null);
-  let docs = $state<DocMeta[]>([]);
-  let config = $state<AppConfig | null>(null);
-  let showSettings = $state(false);
-  let showCreate = $state(false);
-  let creating = $state(false);
   let toasts = $state<ToastMessage[]>([]);
   let toastId = 0;
-  let copiedLoginCmd = $state(false);
-  let copiedRefreshCmd = $state(false);
-  let theme = $state<"dark" | "light">("dark");
-  let filterConflicts = $state(false);
-  let searchQuery = $state("");
-  let deleteConfirm = $state<{ docId: string; title: string } | null>(null);
-  let historyDocId = $state<string | null>(null);
-  let showCommandPalette = $state(false);
 
   function addToast(text: string, type: "error" | "success" | "info" = "error") {
     const id = ++toastId;
@@ -49,6 +40,44 @@
     toasts = toasts.filter((t) => t.id !== id);
   }
 
+  // ─── App state ─────────────────────────────────────
+  let loading = $state(true);
+  let auth = $state<AuthStatus | null>(null);
+  let docs = $state<DocMeta[]>([]);
+  let config = $state<AppConfig | null>(null);
+  let theme = $state<"dark" | "light">("dark");
+  let searchQuery = $state("");
+  let filterConflicts = $state(false);
+
+  // ─── Panel/modal visibility ────────────────────────
+  let showSettings = $state(false);
+  let showCreate = $state(false);
+  let creating = $state(false);
+  let showCommandPalette = $state(false);
+  let deleteConfirm = $state<{ docId: string; title: string } | null>(null);
+  let historyDocId = $state<string | null>(null);
+  let conflictDocId = $state<string | null>(null);
+  // restoreConfirm is intentionally kept for future DocHistory integration
+  // when snapshot restore is exposed via the history panel
+  let copiedLoginCmd = $state(false);
+  let copiedRefreshCmd = $state(false);
+
+  // ─── Derived state ─────────────────────────────────
+  let conflicts = $derived(
+    docs.filter((d) => d.sync_status.type === "Conflict")
+  );
+
+  let syncingCount = $derived(
+    docs.filter((d) => d.sync_status.type === "Syncing").length
+  );
+
+  let displayDocs = $derived(
+    filterConflicts
+      ? docs.filter((d) => d.sync_status.type === "Conflict" || d.sync_status.type === "Error")
+      : docs
+  );
+
+  // ─── Document actions ──────────────────────────────
   async function handleCreate(title: string) {
     if (creating) return;
     creating = true;
@@ -65,17 +94,27 @@
   }
 
   function handleSyncDoc(docId: string) {
-    // Optimistic: set status to syncing immediately
     docs = docs.map((d) => {
       if (d.doc_id === docId) {
         return { ...d, sync_status: { type: "Syncing" as const } };
       }
       return d;
     });
-    addToast("正在同步…", "info");
+    addToast("正在推送…", "info");
     manualSync(docId).catch((e) => {
-      addToast(`同步失败: ${e}`);
+      addToast(`推送失败: ${e}`);
     });
+  }
+
+  async function handlePullDoc(docId: string) {
+    try {
+      addToast("正在拉取远程内容…", "info");
+      const meta = await pullDoc(docId);
+      docs = docs.map((d) => d.doc_id === docId ? meta : d);
+      addToast(`「${meta.title}」已更新`, "success");
+    } catch (e) {
+      addToast(`拉取失败: ${e}`);
+    }
   }
 
   async function handleImportDoc(docId: string) {
@@ -141,6 +180,12 @@
     }
   }
 
+  function handleConflictResolved(doc: DocMeta) {
+    docs = docs.map((d) => d.doc_id === doc.doc_id ? doc : d);
+    addToast(`「${doc.title}」冲突已解决`, "success");
+  }
+
+  // ─── UI helpers ────────────────────────────────────
   function copyToClipboard(text: string, setter: (v: boolean) => void) {
     navigator.clipboard.writeText(text);
     setter(true);
@@ -154,27 +199,38 @@
   }
 
   function handleGlobalKeydown(e: KeyboardEvent) {
-    if ((e.ctrlKey || e.metaKey) && e.key === "n") {
+    if ((e.ctrlKey || e.metaKey) && e.key === "k") {
       e.preventDefault();
-      showCreate = true;
+      // Focus the search input in the toolbar
+      const searchInput = document.querySelector<HTMLInputElement>('.search-wrapper input');
+      searchInput?.focus();
+      return;
     }
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "P") {
       e.preventDefault();
       showCommandPalette = !showCommandPalette;
+      return;
     }
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "N") {
+      e.preventDefault();
+      showCreate = true;
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === "n") {
       e.preventDefault();
       handleQuickNote();
     }
     if (e.key === "Escape") {
       if (showCommandPalette) { showCommandPalette = false; return; }
+      if (conflictDocId) { conflictDocId = null; return; }
       if (historyDocId) { historyDocId = null; return; }
       if (showCreate) { showCreate = false; return; }
       if (showSettings) { showSettings = false; return; }
     }
   }
 
-  onMount(async () => {
+  // ─── Initialization ────────────────────────────────
+  onMount(() => {
     // Restore theme
     const saved = localStorage.getItem("larknotes-theme") as "dark" | "light" | null;
     if (saved) {
@@ -182,22 +238,26 @@
       document.documentElement.setAttribute("data-theme", saved);
     }
 
-    try {
-      const [authResult, docsResult, configResult] = await Promise.allSettled([
-        getAuthStatus(),
-        getDocList(),
-        getAppConfig(),
-      ]);
+    // Initialize data
+    (async () => {
+      try {
+        const [authResult, docsResult, configResult] = await Promise.allSettled([
+          getAuthStatus(),
+          getDocList(),
+          getAppConfig(),
+        ]);
 
-      if (authResult.status === "fulfilled") auth = authResult.value;
-      if (docsResult.status === "fulfilled") docs = docsResult.value;
-      if (configResult.status === "fulfilled") config = configResult.value;
-    } catch (e) {
-      addToast(`初始化失败: ${e}`);
-    } finally {
-      loading = false;
-    }
+        if (authResult.status === "fulfilled") auth = authResult.value;
+        if (docsResult.status === "fulfilled") docs = docsResult.value;
+        if (configResult.status === "fulfilled") config = configResult.value;
+      } catch (e) {
+        addToast(`初始化失败: ${e}`);
+      } finally {
+        loading = false;
+      }
+    })();
 
+    // Listen for sync status updates from backend
     listen<SyncStatusUpdate>("sync-status", (event) => {
       const { doc_id, status, title } = event.payload;
       docs = docs.map((d) => {
@@ -206,37 +266,31 @@
         }
         return d;
       });
-      // Show toast for sync completion
       if (status.type === "Synced") {
         addToast(`「${title ?? doc_id}」同步完成`, "success");
       } else if (status.type === "Conflict") {
         addToast(`「${title ?? doc_id}」同步冲突`, "error");
       }
     });
+
+    // Periodic auth status check (every 60s)
+    const authInterval = setInterval(async () => {
+      try {
+        auth = await getAuthStatus();
+      } catch { /* ignore */ }
+    }, 60_000);
+
+    return () => { clearInterval(authInterval); };
   });
-
-  let conflicts = $derived(
-    docs.filter((d) => d.sync_status.type === "Conflict")
-  );
-
-  let syncingCount = $derived(
-    docs.filter((d) => d.sync_status.type === "Syncing").length
-  );
-
-  let displayDocs = $derived(
-    filterConflicts
-      ? docs.filter((d) => d.sync_status.type === "Conflict" || d.sync_status.type === "Error")
-      : docs
-  );
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <main class="app-shell" style="background: var(--c-bg);" onkeydown={handleGlobalKeydown}>
   {#if loading}
-    <div class="flex-1 flex items-center justify-center" style="color: var(--c-text-tertiary);">
-      <div class="flex flex-col items-center gap-3">
-        <div class="w-6 h-6 border-2 border-current border-t-transparent rounded-full animate-spin"></div>
-        <span class="text-sm tracking-wide">加载中</span>
+    <div class="loading-screen">
+      <div class="loading-content">
+        <div class="loading-spinner"></div>
+        <span class="loading-text">加载中</span>
       </div>
     </div>
   {:else}
@@ -252,35 +306,6 @@
       {theme}
     />
 
-    {#if conflicts.length > 0}
-      <div class="banner banner--warn">
-        <span class="banner-dot banner-dot--red"></span>
-        <span class="banner-text banner-text--red">
-          {conflicts.length} 篇文档存在冲突
-        </span>
-        <button class="banner-action banner-action--red" onclick={() => { filterConflicts = !filterConflicts; }}>
-          {filterConflicts ? "显示全部" : "查看"}
-        </button>
-      </div>
-    {/if}
-
-    {#if auth?.logged_in && auth.needs_refresh}
-      <div class="banner banner--amber">
-        <span class="banner-dot banner-dot--amber"></span>
-        <span class="banner-text banner-text--amber">
-          登录令牌即将过期，同步可能失败 — 在终端运行
-          <button
-            class="cmd-tag cmd-tag--amber"
-            onclick={() => copyToClipboard("lark-cli auth login", (v) => copiedRefreshCmd = v)}
-            title="点击复制"
-          >
-            {copiedRefreshCmd ? "已复制 ✓" : "lark-cli auth login"}
-          </button>
-          刷新令牌
-        </span>
-      </div>
-    {/if}
-
     {#if !auth?.logged_in}
       <div class="banner banner--error">
         <span class="banner-dot banner-dot--red"></span>
@@ -293,7 +318,38 @@
           >
             {copiedLoginCmd ? "已复制 ✓" : "lark-cli auth login"}
           </button>
+          完成登录后刷新
         </span>
+        <button class="banner-action banner-action--red" onclick={handleRefresh}>
+          刷新
+        </button>
+      </div>
+    {:else if auth.needs_refresh}
+      <div class="banner banner--amber">
+        <span class="banner-dot banner-dot--amber"></span>
+        <span class="banner-text banner-text--amber">
+          登录令牌即将过期 — 在终端运行
+          <button
+            class="cmd-tag cmd-tag--amber"
+            onclick={() => copyToClipboard("lark-cli auth login", (v) => copiedRefreshCmd = v)}
+            title="点击复制"
+          >
+            {copiedRefreshCmd ? "已复制 ✓" : "lark-cli auth login"}
+          </button>
+          刷新令牌
+        </span>
+      </div>
+    {/if}
+
+    {#if conflicts.length > 0}
+      <div class="banner banner--warn">
+        <span class="banner-dot banner-dot--red"></span>
+        <span class="banner-text banner-text--red">
+          {conflicts.length} 篇文档存在冲突
+        </span>
+        <button class="banner-action banner-action--red" onclick={() => { filterConflicts = !filterConflicts; }}>
+          {filterConflicts ? "显示全部" : "查看"}
+        </button>
       </div>
     {/if}
 
@@ -303,12 +359,18 @@
           <Settings
             editorCommand={config?.editor_command ?? "notepad"}
             workspacePath={config?.workspace_dir ?? ""}
+            syncDebounceMs={config?.sync_debounce_ms ?? 2000}
+            autoSync={config?.auto_sync ?? true}
+            larkCliPath={config?.lark_cli_path ?? "lark-cli"}
             onClose={() => (showSettings = false)}
             onEditorChange={(e) => {
               if (config) config = { ...config, editor_command: e };
             }}
             onWorkspaceChange={(p) => {
               if (config) config = { ...config, workspace_dir: p };
+            }}
+            onConfigChange={(key, value) => {
+              if (config) config = { ...config, [key]: value };
             }}
             onError={(msg) => addToast(msg)}
           />
@@ -319,10 +381,12 @@
           {searchQuery}
           onError={(msg) => addToast(msg)}
           onSync={handleSyncDoc}
+          onPull={handlePullDoc}
           onImport={handleImportDoc}
           onDelete={handleDeleteDoc}
           onReveal={handleRevealInExplorer}
           onShowHistory={(id) => (historyDocId = id)}
+          onResolveConflict={(id) => (conflictDocId = id)}
         />
       {/if}
     </div>
@@ -335,6 +399,7 @@
     />
   {/if}
 
+  <!-- Modals & overlays -->
   {#if showCreate}
     <CreateDocModal
       onConfirm={handleCreate}
@@ -352,6 +417,7 @@
       onCancel={() => (deleteConfirm = null)}
     />
   {/if}
+
 
   {#if showCommandPalette}
     <CommandPalette
@@ -376,10 +442,50 @@
     />
   {/if}
 
+  {#if conflictDocId}
+    {@const conflictDoc = docs.find((d) => d.doc_id === conflictDocId)}
+    <ConflictResolver
+      docId={conflictDocId}
+      docTitle={conflictDoc?.title ?? "未知文档"}
+      onClose={() => (conflictDocId = null)}
+      onResolved={handleConflictResolved}
+      onError={(msg) => addToast(msg)}
+    />
+  {/if}
+
   <Toast messages={toasts} onDismiss={dismissToast} />
 </main>
 
 <style>
+  .loading-screen {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--c-text-tertiary);
+  }
+  .loading-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+  .loading-spinner {
+    width: 24px;
+    height: 24px;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+  .loading-text {
+    font-size: 13px;
+    letter-spacing: 0.04em;
+  }
+
   .content-area {
     flex: 1;
     display: flex;
@@ -398,6 +504,7 @@
     to { opacity: 1; transform: translateX(0); }
   }
 
+  /* Banners */
   .banner {
     display: flex;
     align-items: center;
