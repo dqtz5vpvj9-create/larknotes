@@ -96,6 +96,15 @@ fn main() {
                 }
             }
 
+            // 3c. Rename files whose names don't match their title.
+            //     This is deferred from editing sessions to avoid confusing editors.
+            {
+                let count = larknotes_sync::rename_stale_paths(&workspace_dir, &storage);
+                if count > 0 {
+                    tracing::info!("启动时重命名了 {} 个文件以匹配标题", count);
+                }
+            }
+
             // 4. Load config from DB
             {
                 let store = storage.lock().expect("Storage lock poisoned at init");
@@ -212,7 +221,45 @@ fn main() {
                 })
                 .build(app)?;
 
-            // 11. Set app state
+            // 11. Window monitor: detects when editor windows close → triggers rename
+            let (window_monitor, mut rename_rx) = larknotes_editor::window_monitor::WindowMonitor::new();
+            let window_monitor = Arc::new(window_monitor);
+
+            // Polling task: checks window titles every 1s
+            {
+                let monitor = window_monitor.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        monitor.check_once();
+                    }
+                });
+            }
+
+            // Rename task: receives close notifications → renames files
+            {
+                let monitor_storage = storage.clone();
+                let monitor_workspace = config.read().unwrap().workspace_dir.clone();
+                let monitor_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    while let Some(closed_doc_ids) = rename_rx.recv().await {
+                        tracing::info!(
+                            "编辑器窗口已关闭 {} 个文档，检查是否需要重命名",
+                            closed_doc_ids.len()
+                        );
+                        let count = larknotes_sync::rename_stale_paths(
+                            &monitor_workspace,
+                            &monitor_storage,
+                        );
+                        if count > 0 {
+                            tracing::info!("编辑器关闭后重命名了 {} 个文件", count);
+                            let _ = monitor_handle.emit("docs-changed", ());
+                        }
+                    }
+                });
+            }
+
+            // 12. Set app state
             let shutdown_tx = sync_tx.clone();
             app.manage(AppState {
                 provider,
@@ -221,6 +268,7 @@ fn main() {
                 config,
                 editor,
                 debounce_ms,
+                window_monitor,
             });
             app.manage(ShutdownSender(Mutex::new(Some(shutdown_tx))));
 

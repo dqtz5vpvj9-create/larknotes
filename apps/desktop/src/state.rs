@@ -1,4 +1,5 @@
 use larknotes_core::AppConfig;
+use larknotes_editor::window_monitor::WindowMonitor;
 use larknotes_editor::EditorLauncher;
 use larknotes_provider_cli::CliProvider;
 use larknotes_storage::Storage;
@@ -14,4 +15,7 @@ pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub editor: Arc<RwLock<EditorLauncher>>,
     pub debounce_ms: Arc<AtomicU64>,
+    /// Monitors editor windows. When a window closes (filename disappears
+    /// from all window titles), the background task renames the file.
+    pub window_monitor: Arc<WindowMonitor>,
 }

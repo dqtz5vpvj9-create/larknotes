@@ -40,8 +40,8 @@ export const manualSync = (docId: string) =>
 export const importDoc = (docId: string) =>
   invoke<DocMeta>("import_doc", { docId });
 
-export const deleteDoc = (docId: string) =>
-  invoke<void>("delete_doc", { docId });
+export const deleteDoc = (docId: string, forceLocal?: boolean) =>
+  invoke<void>("delete_doc", { docId, forceLocal: forceLocal ?? false });
 
 export const revealInExplorer = (docId: string) =>
   invoke<void>("reveal_in_explorer", { docId });

@@ -1,3 +1,5 @@
+pub mod window_monitor;
+
 use larknotes_core::LarkNotesError;
 use std::path::Path;
 use std::process::Command;
@@ -21,7 +23,7 @@ impl EditorLauncher {
         self.command = command.to_string();
     }
 
-    pub fn open_file(&self, path: &Path) -> Result<(), LarkNotesError> {
+    pub fn open_file(&self, path: &Path) -> Result<std::process::Child, LarkNotesError> {
         Command::new(&self.command)
             .arg(path)
             .spawn()
@@ -30,8 +32,7 @@ impl EditorLauncher {
                     "启动编辑器 '{}' 失败: {e}",
                     self.command
                 ))
-            })?;
-        Ok(())
+            })
     }
 
     pub fn open_in_explorer(path: &Path) -> Result<(), LarkNotesError> {

@@ -48,8 +48,14 @@ pub async fn create_doc(
     // Open editor right away — user sees it instantly
     {
         let editor = state.editor.read().map_err(lock_err)?;
-        if let Err(e) = editor.open_file(&content_path) {
-            tracing::warn!("打开编辑器失败: {e}");
+        match editor.open_file(&content_path) {
+            Ok(_) => {
+                // Track filename; window monitor will detect when editor closes
+                let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
+                let tmp_key = format!("pending_{}", content_path.display());
+                state.window_monitor.track(&tmp_key, &filename);
+            }
+            Err(e) => tracing::warn!("打开编辑器失败: {e}"),
         }
     }
 
@@ -72,6 +78,14 @@ pub async fn create_doc(
         .map_err(lock_err)?
         .upsert_doc(&meta)
         .map_err(|e| e.to_string())?;
+
+    // Move tracking from temp key to real doc_id
+    {
+        let tmp_key = format!("pending_{}", content_path.display());
+        let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
+        state.window_monitor.untrack(&tmp_key);
+        state.window_monitor.track(&meta.doc_id, &filename);
+    }
 
     Ok(meta)
 }
@@ -132,12 +146,15 @@ pub async fn open_doc_in_editor(
         cp
     };
 
-    state
-        .editor
-        .read()
-        .map_err(lock_err)?
-        .open_file(&cp)
-        .map_err(|e| e.to_string())
+    let editor = state.editor.read().map_err(lock_err)?;
+    match editor.open_file(&cp) {
+        Ok(_) => {
+            let filename = cp.file_name().unwrap().to_string_lossy().to_string();
+            state.window_monitor.track(&doc_id, &filename);
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -360,8 +377,12 @@ pub async fn import_doc(
     // 5. Open in editor
     {
         let editor = state.editor.read().map_err(lock_err)?;
-        if let Err(e) = editor.open_file(&content_path) {
-            tracing::warn!("打开编辑器失败: {e}");
+        match editor.open_file(&content_path) {
+            Ok(_) => {
+                let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
+                state.window_monitor.track(&doc_id, &filename);
+            }
+            Err(e) => tracing::warn!("打开编辑器失败: {e}"),
         }
     }
 
@@ -372,8 +393,17 @@ pub async fn import_doc(
 pub async fn delete_doc(
     state: tauri::State<'_, AppState>,
     doc_id: String,
+    force_local: Option<bool>,
 ) -> Result<(), String> {
-    // Get local path and delete from DB in a single lock
+    // Try remote delete first (unless user already confirmed local-only)
+    if !force_local.unwrap_or(false) {
+        if let Err(e) = state.provider.delete_doc(&doc_id).await {
+            // Return error with a prefix so frontend can distinguish and show confirm dialog
+            return Err(format!("REMOTE_DELETE_FAILED:{e}"));
+        }
+    }
+
+    // Delete from DB and local file
     let local_path = {
         let store = state.storage.lock().map_err(lock_err)?;
         let path = store.get_doc(&doc_id).ok().flatten().and_then(|d| d.local_path);
@@ -381,7 +411,6 @@ pub async fn delete_doc(
         path
     };
 
-    // Delete local file (if exists)
     if let Some(path) = local_path {
         let _ = std::fs::remove_file(&path);
     }
@@ -494,8 +523,13 @@ pub async fn quick_note(
     // Open editor immediately
     {
         let editor = state.editor.read().map_err(lock_err)?;
-        if let Err(e) = editor.open_file(&content_path) {
-            tracing::warn!("打开编辑器失败: {e}");
+        match editor.open_file(&content_path) {
+            Ok(_) => {
+                let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
+                let tmp_key = format!("pending_{}", content_path.display());
+                state.window_monitor.track(&tmp_key, &filename);
+            }
+            Err(e) => tracing::warn!("打开编辑器失败: {e}"),
         }
     }
 
@@ -518,6 +552,14 @@ pub async fn quick_note(
         .map_err(lock_err)?
         .upsert_doc(&meta)
         .map_err(|e| e.to_string())?;
+
+    // Move tracking from temp key to real doc_id
+    {
+        let tmp_key = format!("pending_{}", content_path.display());
+        let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
+        state.window_monitor.untrack(&tmp_key);
+        state.window_monitor.track(&meta.doc_id, &filename);
+    }
 
     Ok(meta)
 }

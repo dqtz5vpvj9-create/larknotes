@@ -1,4 +1,21 @@
 {
+  "permissions": {
+    "allow": [
+      "Read(//Applications/**)",
+      "Read(//Applications/Typora.app/Contents/**)",
+      "Bash(mdfind \"kMDItemCFBundleIdentifier == 'abnerworks.Typora'\")",
+      "Read(//c/Users/lixinrui/Applications/**)",
+      "Bash(\"/c/Users/lixinrui/Applications/Typora/Typora.exe\" /tmp/rename_test_old.md)",
+      "Bash(mv /tmp/rename_test_old.md /tmp/rename_test_new.md)",
+      "Bash(powershell.exe:*)",
+      "Bash(taskkill //IM Typora.exe //F)",
+      "Bash(cargo check:*)",
+      "Bash(cargo doc:*)",
+      "Bash(cargo test:*)",
+      "Bash(taskkill //PID 38000 //F)",
+      "Bash(taskkill //IM notepad.exe //F)"
+    ]
+  },
   "enabledPlugins": {
     "frontend-design@claude-plugins-official": true
   }

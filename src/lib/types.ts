@@ -143,6 +143,24 @@ export function formatRelativeTime(iso: string): string {
   }
 }
 
+/** Format a date as a short localized string, e.g. "3月14日 10:46" */
+export function formatShortDate(iso: string): string {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const sameYear = d.getFullYear() === now.getFullYear();
+    if (sameYear) {
+      return d.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" })
+        + " " + d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+    }
+    return d.toLocaleDateString("zh-CN", { year: "numeric", month: "numeric", day: "numeric" })
+      + " " + d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
 /** Split text into segments for highlight rendering */
 export function highlightSegments(text: string, query: string): { text: string; match: boolean }[] {
   if (!query) return [{ text, match: false }];

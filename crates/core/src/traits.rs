@@ -7,4 +7,5 @@ pub trait DocProvider: Send + Sync {
     async fn create_doc(&self, title: &str, markdown: &str) -> Result<DocMeta, LarkNotesError>;
     async fn fetch_doc(&self, doc_id: &str) -> Result<String, LarkNotesError>;
     async fn update_doc(&self, doc_id: &str, markdown: &str) -> Result<(), LarkNotesError>;
+    async fn delete_doc(&self, doc_id: &str) -> Result<(), LarkNotesError>;
 }

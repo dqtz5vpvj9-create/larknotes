@@ -253,47 +253,18 @@ impl SyncEngine {
         self.emit_status(doc_id, SyncStatus::Conflict, None);
     }
 
-    fn mark_synced(&self, doc_id: &str, new_hash: &str, title: &str, content: &str) {
+    fn mark_synced(&self, doc_id: &str, new_hash: &str, _title: &str, content: &str) {
         if let Ok(store) = self.storage.lock() {
             let _ = store.update_content_hash(doc_id, new_hash);
             let _ = store.update_sync_status(doc_id, &SyncStatus::Synced);
-            let _ = store.update_title(doc_id, title);
+            // NOTE: We do NOT update title here. Title + filename are updated
+            // atomically by rename_stale_paths() after the editor closes.
+            // Updating title here would cause the UI to show a new name while
+            // the file still has the old name, creating a race condition.
             let _ = store.add_sync_history(doc_id, "push", Some(new_hash));
             let _ = store.save_snapshot(doc_id, content, new_hash);
-
-            // Rename local file if title changed (filename = title convention)
-            if let Ok(Some(doc)) = store.get_doc(doc_id) {
-                if let Some(ref old_path_str) = doc.local_path {
-                    let old_path = std::path::PathBuf::from(old_path_str);
-                    // Compare with titled_content_path (not unique_) to check if rename is needed.
-                    // If old_path already matches the title, no rename needed.
-                    let expected_path = titled_content_path(&self.workspace_dir, title);
-                    if old_path != expected_path && old_path.exists() {
-                        // Use unique_content_path for the actual target to avoid collisions
-                        let new_path = unique_content_path(&self.workspace_dir, title);
-                        // Update DB first to prevent watcher from triggering on intermediate state
-                        let new_path_str = new_path.to_string_lossy().to_string();
-                        let _ = store.update_local_path(doc_id, &new_path_str);
-                        if let Err(e) = std::fs::rename(&old_path, &new_path) {
-                            tracing::warn!(
-                                "重命名文件失败 {} → {}: {e}",
-                                old_path.display(),
-                                new_path.display()
-                            );
-                            // Revert DB if rename failed
-                            let _ = store.update_local_path(doc_id, old_path_str);
-                        } else {
-                            tracing::info!(
-                                "文件已重命名: {} → {}",
-                                old_path.display(),
-                                new_path.display()
-                            );
-                        }
-                    }
-                }
-            }
         }
-        self.emit_status(doc_id, SyncStatus::Synced, Some(title.to_string()));
+        self.emit_status(doc_id, SyncStatus::Synced, None);
         tracing::info!("同步成功: {doc_id}");
     }
 
@@ -400,6 +371,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((doc_id.to_string(), markdown.to_string()));
+            Ok(())
+        }
+        async fn delete_doc(&self, _doc_id: &str) -> Result<(), LarkNotesError> {
             Ok(())
         }
     }
@@ -518,7 +492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_one_extracts_title() {
+    async fn test_sync_one_does_not_update_title() {
         let (tmp, storage) = setup_test_workspace();
         let workspace = tmp.path().to_path_buf();
         let provider = Arc::new(MockProvider::new());
@@ -529,8 +503,9 @@ mod tests {
         let engine = Arc::new(engine);
         engine.sync_one("doc4").await;
 
+        // Title should NOT be updated by sync — deferred to rename_stale_paths after editor closes
         let doc = storage.lock().unwrap().get_doc("doc4").unwrap().unwrap();
-        assert_eq!(doc.title, "My Custom Title");
+        assert_eq!(doc.title, "Old Title");
     }
 
     #[tokio::test(start_paused = true)]
@@ -818,10 +793,10 @@ mod tests {
         assert_eq!(snapshots[0].content, "# History test");
     }
 
-    // ─── Scenario 1: title change in editor → file rename ──
+    // ─── mark_synced defers rename (editor safety) ────────
 
     #[tokio::test]
-    async fn test_mark_synced_renames_file_on_title_change() {
+    async fn test_mark_synced_does_not_rename_file() {
         let (tmp, storage) = setup_test_workspace();
         let workspace = tmp.path().to_path_buf();
         let provider = Arc::new(MockProvider::new());
@@ -831,7 +806,6 @@ mod tests {
             &workspace, &storage, "doc_rename", "Old Title",
             "# Old Title\n\nBody", None,
         );
-        assert!(old_path.exists());
 
         // User edits the file to change the title
         std::fs::write(&old_path, "# New Title\n\nBody").unwrap();
@@ -843,83 +817,15 @@ mod tests {
         let engine = Arc::new(engine);
         engine.sync_one("doc_rename").await;
 
-        // File should be renamed to "New Title.md"
+        // File should NOT be renamed (deferred to editor close via rename_stale_paths)
+        assert!(old_path.exists(), "File should stay at old path during editing");
         let new_path = workspace.join("docs").join("New Title.md");
-        assert!(new_path.exists(), "File should be renamed to New Title.md");
-        assert!(!old_path.exists(), "Old file should no longer exist");
+        assert!(!new_path.exists(), "File should NOT be renamed during sync");
 
-        // DB should have updated local_path
+        // DB title should NOT be updated during sync — deferred to rename_stale_paths
         let doc = storage.lock().unwrap().get_doc("doc_rename").unwrap().unwrap();
-        assert_eq!(doc.title, "New Title");
-        assert_eq!(
-            doc.local_path.unwrap(),
-            new_path.to_string_lossy().to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mark_synced_no_rename_when_title_unchanged() {
-        let (tmp, storage) = setup_test_workspace();
-        let workspace = tmp.path().to_path_buf();
-        let provider = Arc::new(MockProvider::new());
-
-        let path = create_test_doc(
-            &workspace, &storage, "doc_same", "Same Title",
-            "# Same Title\n\nOld body", None,
-        );
-
-        // Edit body only, title unchanged
-        std::fs::write(&path, "# Same Title\n\nNew body").unwrap();
-
-        let (engine, _) = SyncEngine::new(
-            provider.clone(), storage.clone(), workspace.clone(),
-            Arc::new(AtomicU64::new(2000)),
-        );
-        let engine = Arc::new(engine);
-        engine.sync_one("doc_same").await;
-
-        // File should still be at the same path
-        assert!(path.exists(), "File should not move when title is unchanged");
-        let doc = storage.lock().unwrap().get_doc("doc_same").unwrap().unwrap();
-        assert_eq!(doc.local_path.unwrap(), path.to_string_lossy().to_string());
-    }
-
-    // ─── Scenario 5: title collision → unique path ──────────
-
-    #[tokio::test]
-    async fn test_mark_synced_title_collision_uses_unique_path() {
-        let (tmp, storage) = setup_test_workspace();
-        let workspace = tmp.path().to_path_buf();
-        let provider = Arc::new(MockProvider::new());
-
-        // Create two docs, one already has the target filename
-        create_test_doc(
-            &workspace, &storage, "existing_doc", "Target Title",
-            "# Target Title\n\nExisting doc", Some(hash_content(b"# Target Title\n\nExisting doc")),
-        );
-
-        let old_path = create_test_doc(
-            &workspace, &storage, "moving_doc", "Old Name",
-            "# Old Name\n\nBody", None,
-        );
-
-        // Edit file to change title to collide
-        std::fs::write(&old_path, "# Target Title\n\nBody").unwrap();
-
-        let (engine, _) = SyncEngine::new(
-            provider.clone(), storage.clone(), workspace.clone(),
-            Arc::new(AtomicU64::new(2000)),
-        );
-        let engine = Arc::new(engine);
-        engine.sync_one("moving_doc").await;
-
-        // Should get "Target Title (2).md" since "Target Title.md" already exists
-        let unique_path = workspace.join("docs").join("Target Title (2).md");
-        assert!(unique_path.exists(), "Should use unique path to avoid collision");
-        assert!(!old_path.exists(), "Old file should be gone");
-
-        // Original doc should be untouched
-        let existing = workspace.join("docs").join("Target Title.md");
-        assert!(existing.exists(), "Existing doc should not be overwritten");
+        assert_eq!(doc.title, "Old Title");
+        // local_path should still point to old file
+        assert_eq!(doc.local_path.unwrap(), old_path.to_string_lossy().to_string());
     }
 }

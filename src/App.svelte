@@ -141,6 +141,28 @@
       await deleteDoc(docId);
       docs = docs.filter((d) => d.doc_id !== docId);
       addToast("已删除", "success");
+    } catch (e: any) {
+      const msg = String(e);
+      if (msg.startsWith("REMOTE_DELETE_FAILED:")) {
+        // Remote delete failed — ask user if they want to delete locally only
+        const reason = msg.slice("REMOTE_DELETE_FAILED:".length);
+        remoteDeleteFail = { docId, reason };
+      } else {
+        addToast(`删除失败: ${e}`);
+      }
+    }
+  }
+
+  let remoteDeleteFail = $state<{ docId: string; reason: string } | null>(null);
+
+  async function confirmLocalOnlyDelete() {
+    if (!remoteDeleteFail) return;
+    const { docId } = remoteDeleteFail;
+    remoteDeleteFail = null;
+    try {
+      await deleteDoc(docId, true);
+      docs = docs.filter((d) => d.doc_id !== docId);
+      addToast("已删除本地文档", "success");
     } catch (e) {
       addToast(`删除失败: ${e}`);
     }
@@ -270,6 +292,15 @@
         addToast(`「${title ?? doc_id}」同步完成`, "success");
       } else if (status.type === "Conflict") {
         addToast(`「${title ?? doc_id}」同步冲突`, "error");
+      }
+    });
+
+    // Listen for doc list changes (e.g. after editor-close rename)
+    listen("docs-changed", async () => {
+      try {
+        docs = await getDocList();
+      } catch (e) {
+        console.error("Failed to refresh docs:", e);
       }
     });
 
@@ -410,11 +441,22 @@
   {#if deleteConfirm}
     <ConfirmDialog
       title="删除文档"
-      message={`确定删除「${deleteConfirm.title}」？此操作仅删除本地副本，不影响飞书文档。`}
+      message={`确定删除「${deleteConfirm.title}」？将同时删除本地文件和飞书云端文档。`}
       confirmLabel="删除"
       danger={true}
       onConfirm={confirmDelete}
       onCancel={() => (deleteConfirm = null)}
+    />
+  {/if}
+
+  {#if remoteDeleteFail}
+    <ConfirmDialog
+      title="远程删除失败"
+      message={`无法删除飞书云端文档：${remoteDeleteFail.reason}\n\n是否仅删除本地副本？`}
+      confirmLabel="仅删除本地"
+      danger={true}
+      onConfirm={confirmLocalOnlyDelete}
+      onCancel={() => (remoteDeleteFail = null)}
     />
   {/if}
 

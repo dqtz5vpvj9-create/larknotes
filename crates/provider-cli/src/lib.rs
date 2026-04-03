@@ -334,6 +334,11 @@ impl DocProvider for CliProvider {
         .await?;
         Ok(())
     }
+
+    async fn delete_doc(&self, doc_id: &str) -> Result<(), LarkNotesError> {
+        self.run_cli(&["docs", "+delete", "--doc", doc_id]).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

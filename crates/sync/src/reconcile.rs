@@ -199,6 +199,114 @@ pub fn reconcile_paths(
     matches
 }
 
+/// Rename local files whose filename doesn't match their content title.
+/// Reads each file, extracts the title from content, and if it differs from
+/// the current filename: updates DB title, renames file, updates DB path —
+/// all atomically so the UI and filesystem stay in sync.
+///
+/// Called after editor process exits and at app startup.
+///
+/// Returns the number of files renamed.
+pub fn rename_stale_paths(
+    workspace: &Path,
+    storage: &Arc<Mutex<Storage>>,
+) -> usize {
+    let store = match storage.lock() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("rename_stale_paths: storage lock poisoned: {e}");
+            return 0;
+        }
+    };
+
+    let all_docs = match store.list_docs() {
+        Ok(docs) => docs,
+        Err(e) => {
+            tracing::error!("rename_stale_paths: list_docs failed: {e}");
+            return 0;
+        }
+    };
+
+    let mut count = 0;
+
+    for doc in &all_docs {
+        let Some(ref local_path_str) = doc.local_path else {
+            continue;
+        };
+        let old_path = PathBuf::from(local_path_str);
+        if !old_path.exists() {
+            continue; // Orphan — handled by reconcile_paths
+        }
+
+        // Read the file and extract the actual title from content
+        let content = match std::fs::read_to_string(&old_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("rename_stale_paths: read failed {}: {e}", old_path.display());
+                continue;
+            }
+        };
+        let content_title = extract_title(&content);
+
+        // Check if filename already matches the content title
+        let expected_path = titled_content_path(workspace, &content_title);
+        if old_path == expected_path {
+            // Filename matches. Still update DB title if it's stale.
+            if doc.title != content_title {
+                let _ = store.update_title(&doc.doc_id, &content_title);
+            }
+            continue;
+        }
+
+        // Compute a safe target path (avoids collisions)
+        let new_path = unique_content_path(workspace, &content_title);
+
+        // Update DB atomically: title + path, then rename file
+        if let Err(e) = store.update_title(&doc.doc_id, &content_title) {
+            tracing::error!(
+                "rename_stale_paths: update_title failed for {}: {e}",
+                doc.doc_id
+            );
+            continue;
+        }
+        let new_path_str = new_path.to_string_lossy().to_string();
+        if let Err(e) = store.update_local_path(&doc.doc_id, &new_path_str) {
+            tracing::error!(
+                "rename_stale_paths: update_local_path failed for {}: {e}",
+                doc.doc_id
+            );
+            // Revert title
+            let _ = store.update_title(&doc.doc_id, &doc.title);
+            continue;
+        }
+
+        match std::fs::rename(&old_path, &new_path) {
+            Ok(()) => {
+                tracing::info!(
+                    "rename_stale_paths: {} → {} (doc={}, title='{}')",
+                    old_path.display(),
+                    new_path.display(),
+                    doc.doc_id,
+                    content_title,
+                );
+                count += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "rename_stale_paths: rename failed {} → {}: {e}",
+                    old_path.display(),
+                    new_path.display()
+                );
+                // Revert DB
+                let _ = store.update_local_path(&doc.doc_id, local_path_str);
+                let _ = store.update_title(&doc.doc_id, &doc.title);
+            }
+        }
+    }
+
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +544,100 @@ mod tests {
 
         let matches = reconcile_paths(tmp.path(), &storage);
         assert!(matches.is_empty(), "Docs without local_path are not orphans");
+    }
+
+    // ─── rename_stale_paths tests ───────────────────────
+
+    #[test]
+    fn test_rename_stale_paths_renames_mismatched_file() {
+        let (tmp, storage) = setup_reconcile_test();
+        let content = "# New Title\n\nBody";
+
+        // File exists at old path, but DB title has been updated to "New Title"
+        let old_path = tmp.path().join("docs").join("Old Title.md");
+        std::fs::write(&old_path, content).unwrap();
+
+        insert_doc(
+            &storage, "doc1", "New Title",
+            Some(&old_path.to_string_lossy()),
+            Some(&hash_content(content.as_bytes())),
+        );
+
+        let count = rename_stale_paths(tmp.path(), &storage);
+        assert_eq!(count, 1);
+
+        // File should now be at "New Title.md"
+        let new_path = tmp.path().join("docs").join("New Title.md");
+        assert!(new_path.exists(), "File should be renamed to match title");
+        assert!(!old_path.exists(), "Old file should be gone");
+
+        // DB should point to new path
+        let doc = storage.lock().unwrap().get_doc("doc1").unwrap().unwrap();
+        assert_eq!(doc.local_path.unwrap(), new_path.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn test_rename_stale_paths_skips_matching_file() {
+        let (tmp, storage) = setup_reconcile_test();
+        let path = tmp.path().join("docs").join("My Doc.md");
+        std::fs::write(&path, "# My Doc\n\nBody").unwrap();
+
+        insert_doc(
+            &storage, "doc1", "My Doc",
+            Some(&path.to_string_lossy()),
+            None,
+        );
+
+        let count = rename_stale_paths(tmp.path(), &storage);
+        assert_eq!(count, 0, "Should not rename when filename already matches title");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_rename_stale_paths_handles_collision() {
+        let (tmp, storage) = setup_reconcile_test();
+
+        // Existing file at the target name
+        let existing = tmp.path().join("docs").join("Target.md");
+        std::fs::write(&existing, "# Target\n\nExisting").unwrap();
+        insert_doc(
+            &storage, "existing", "Target",
+            Some(&existing.to_string_lossy()),
+            None,
+        );
+
+        // Stale file that needs rename to "Target" but it's taken
+        let stale = tmp.path().join("docs").join("Old Name.md");
+        std::fs::write(&stale, "# Target\n\nNew doc").unwrap();
+        insert_doc(
+            &storage, "stale", "Target",
+            Some(&stale.to_string_lossy()),
+            None,
+        );
+
+        let count = rename_stale_paths(tmp.path(), &storage);
+        assert_eq!(count, 1);
+
+        // Should use unique path "Target (2).md"
+        let unique = tmp.path().join("docs").join("Target (2).md");
+        assert!(unique.exists(), "Should rename to Target (2).md");
+        assert!(existing.exists(), "Original Target.md should be untouched");
+        assert!(!stale.exists(), "Old Name.md should be gone");
+    }
+
+    #[test]
+    fn test_rename_stale_paths_skips_orphan_docs() {
+        let (tmp, storage) = setup_reconcile_test();
+
+        // Doc with local_path that doesn't exist on disk — orphan, skip it
+        let missing = tmp.path().join("docs").join("Missing.md");
+        insert_doc(
+            &storage, "doc1", "Different Title",
+            Some(&missing.to_string_lossy()),
+            None,
+        );
+
+        let count = rename_stale_paths(tmp.path(), &storage);
+        assert_eq!(count, 0, "Should skip orphan docs (file doesn't exist)");
     }
 }

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { openDocInEditor } from "../api";
-  import { syncStatusLabel, syncStatusColor, highlightSegments, formatRelativeTime, sortDocs } from "../types";
+  import { syncStatusLabel, syncStatusColor, highlightSegments, formatRelativeTime, formatShortDate, sortDocs } from "../types";
   import type { DocMeta, SortField, SortDirection } from "../types";
   import ContextMenu from "./ContextMenu.svelte";
 
@@ -127,7 +127,7 @@
         </svg>
       </div>
       <p class="empty-title">还没有文档</p>
-      <p class="empty-hint">点击上方 <kbd class="empty-kbd">+ 新建</kbd> 或按 <kbd class="empty-kbd">Ctrl+N</kbd> 创建第一篇</p>
+      <p class="empty-hint">点击上方 <kbd class="empty-kbd">快速笔记</kbd> 或按 <kbd class="empty-kbd">Ctrl+N</kbd> 创建第一篇</p>
       <p class="empty-hint">也可以使用搜索功能从飞书导入已有文档</p>
     </div>
   {:else if docs.length === 0 && searchQuery}
@@ -182,7 +182,7 @@
               {/if}
             </span>
             <span class="doc-meta">
-              {#if doc.owner_name}{doc.owner_name} · {/if}{formatRelativeTime(doc.updated_at)}
+              {#if doc.owner_name}{doc.owner_name} · {/if}{formatRelativeTime(doc.updated_at)}{#if doc.created_at} · 创建于 {formatShortDate(doc.created_at)}{/if}
             </span>
           </div>
 
