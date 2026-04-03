@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// Grace period after tracking before we start checking.
+/// Editors like Typora are launchers — the spawned child exits immediately,
+/// and the actual editor window takes a few seconds to appear.
+const GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Checks whether a file is currently open in any visible window.
 pub trait FileOpenChecker: Send + Sync {
@@ -68,13 +74,23 @@ pub fn is_file_in_any_window(filename: &str) -> bool {
     FOUND.with(|f| f.load(Ordering::SeqCst))
 }
 
+/// A tracked file entry with its tracking timestamp.
+struct TrackedFile {
+    filename: String,
+    tracked_at: Instant,
+    /// Keep editor child handle alive to prevent launcher-spawned editors
+    /// from misbehaving when the handle is dropped immediately.
+    _child: Option<std::process::Child>,
+}
+
 /// Monitors tracked files and notifies when their editor windows close.
 ///
 /// Generic over `FileOpenChecker` so that tests can inject a mock.
 pub struct WindowMonitor<C: FileOpenChecker = DefaultChecker> {
-    tracked: Arc<Mutex<HashMap<String, String>>>, // doc_id → filename
+    tracked: Arc<Mutex<HashMap<String, TrackedFile>>>, // doc_id → tracked file
     checker: Arc<C>,
     rename_tx: mpsc::UnboundedSender<Vec<String>>,
+    grace_period: Duration,
 }
 
 /// Default checker picks the platform implementation.
@@ -107,6 +123,7 @@ impl WindowMonitor<DefaultChecker> {
                 tracked: Arc::new(Mutex::new(HashMap::new())),
                 checker,
                 rename_tx: tx,
+                grace_period: GRACE_PERIOD,
             },
             rx,
         )
@@ -115,6 +132,7 @@ impl WindowMonitor<DefaultChecker> {
 
 impl<C: FileOpenChecker> WindowMonitor<C> {
     /// Create a monitor with a custom checker (for testing).
+    /// Uses zero grace period so tests don't need to wait.
     pub fn with_checker(checker: C) -> (Self, mpsc::UnboundedReceiver<Vec<String>>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
@@ -122,6 +140,7 @@ impl<C: FileOpenChecker> WindowMonitor<C> {
                 tracked: Arc::new(Mutex::new(HashMap::new())),
                 checker: Arc::new(checker),
                 rename_tx: tx,
+                grace_period: Duration::ZERO,
             },
             rx,
         )
@@ -129,8 +148,26 @@ impl<C: FileOpenChecker> WindowMonitor<C> {
 
     /// Start tracking a file opened in an editor.
     pub fn track(&self, doc_id: &str, filename: &str) {
+        self.track_with_child(doc_id, filename, None);
+    }
+
+    /// Track a file and keep the editor's Child handle alive.
+    /// Some editors (Typora) misbehave if the Child handle is dropped immediately.
+    pub fn track_with_child(
+        &self,
+        doc_id: &str,
+        filename: &str,
+        child: Option<std::process::Child>,
+    ) {
         if let Ok(mut map) = self.tracked.lock() {
-            map.insert(doc_id.to_string(), filename.to_string());
+            map.insert(
+                doc_id.to_string(),
+                TrackedFile {
+                    filename: filename.to_string(),
+                    tracked_at: Instant::now(),
+                    _child: child,
+                },
+            );
         }
     }
 
@@ -141,9 +178,10 @@ impl<C: FileOpenChecker> WindowMonitor<C> {
         }
     }
 
-    /// Run one check cycle: for each tracked file, ask the checker if it's
-    /// still open. Files that are no longer open are removed from tracking
-    /// and their doc_ids are sent through the channel.
+    /// Run one check cycle: for each tracked file that has passed the grace
+    /// period, ask the checker if it's still open. Files that are no longer
+    /// open are removed from tracking and their doc_ids are sent through
+    /// the channel.
     pub fn check_once(&self) {
         let closed: Vec<String> = {
             let map = match self.tracked.lock() {
@@ -151,7 +189,10 @@ impl<C: FileOpenChecker> WindowMonitor<C> {
                 Err(_) => return,
             };
             map.iter()
-                .filter(|(_, filename)| !self.checker.is_file_open(filename))
+                .filter(|(_, tf)| {
+                    tf.tracked_at.elapsed() >= self.grace_period
+                        && !self.checker.is_file_open(&tf.filename)
+                })
                 .map(|(doc_id, _)| doc_id.clone())
                 .collect()
         };
@@ -325,6 +366,7 @@ mod tests {
     #[test]
     fn test_file_never_opened_triggers_immediately() {
         // File is tracked but was never marked open → checker returns false → triggers
+        // (with_checker uses zero grace period for tests)
         let mock = MockFileOpenChecker::new();
         let (monitor, mut rx) = WindowMonitor::with_checker(mock);
         monitor.track("doc1", "never_opened.md");
@@ -332,6 +374,32 @@ mod tests {
         monitor.check_once();
         let closed = rx.try_recv().expect("Should trigger for file not in any window");
         assert_eq!(closed, vec!["doc1"]);
+    }
+
+    #[test]
+    fn test_grace_period_prevents_premature_detection() {
+        // Simulate the Typora scenario: file tracked, but no window yet
+        // (editor launcher exits before window appears)
+        let mock = MockFileOpenChecker::new();
+        // Don't mark_open — simulates the gap between launcher exit and window appearing
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let monitor = WindowMonitor {
+            tracked: Arc::new(Mutex::new(HashMap::new())),
+            checker: Arc::new(mock.clone()),
+            rename_tx: tx,
+            grace_period: Duration::from_secs(10), // 10 second grace period
+        };
+        let mut rx = rx;
+
+        monitor.track("doc1", "test.md");
+
+        // Immediately check — should NOT trigger because grace period hasn't elapsed
+        monitor.check_once();
+        assert!(
+            rx.try_recv().is_err(),
+            "Should not fire during grace period even if file not in any window"
+        );
     }
 
     // ─── Integration test with real window (Windows only) ───

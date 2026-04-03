@@ -49,11 +49,10 @@ pub async fn create_doc(
     {
         let editor = state.editor.read().map_err(lock_err)?;
         match editor.open_file(&content_path) {
-            Ok(_) => {
-                // Track filename; window monitor will detect when editor closes
+            Ok(child) => {
                 let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
                 let tmp_key = format!("pending_{}", content_path.display());
-                state.window_monitor.track(&tmp_key, &filename);
+                state.window_monitor.track_with_child(&tmp_key, &filename, Some(child));
             }
             Err(e) => tracing::warn!("打开编辑器失败: {e}"),
         }
@@ -148,9 +147,9 @@ pub async fn open_doc_in_editor(
 
     let editor = state.editor.read().map_err(lock_err)?;
     match editor.open_file(&cp) {
-        Ok(_) => {
+        Ok(child) => {
             let filename = cp.file_name().unwrap().to_string_lossy().to_string();
-            state.window_monitor.track(&doc_id, &filename);
+            state.window_monitor.track_with_child(&doc_id, &filename, Some(child));
             Ok(())
         }
         Err(e) => Err(e.to_string()),
@@ -238,10 +237,10 @@ pub async fn detect_editors() -> Result<Vec<(String, String)>, String> {
 
         let win_candidates: Vec<(&str, Vec<std::path::PathBuf>)> = vec![
             ("Typora", vec![
-                home.join("Applications").join("Typora").join("Typora.exe"),
                 std::path::PathBuf::from(&program_files).join("Typora").join("Typora.exe"),
                 std::path::PathBuf::from(&program_files_x86).join("Typora").join("Typora.exe"),
                 std::path::PathBuf::from(&local_appdata).join("Programs").join("Typora").join("Typora.exe"),
+                home.join("Applications").join("Typora").join("Typora.exe"),
             ]),
             ("Obsidian", vec![
                 std::path::PathBuf::from(&local_appdata).join("Obsidian").join("Obsidian.exe"),
@@ -378,9 +377,9 @@ pub async fn import_doc(
     {
         let editor = state.editor.read().map_err(lock_err)?;
         match editor.open_file(&content_path) {
-            Ok(_) => {
+            Ok(child) => {
                 let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
-                state.window_monitor.track(&doc_id, &filename);
+                state.window_monitor.track_with_child(&doc_id, &filename, Some(child));
             }
             Err(e) => tracing::warn!("打开编辑器失败: {e}"),
         }
@@ -524,10 +523,10 @@ pub async fn quick_note(
     {
         let editor = state.editor.read().map_err(lock_err)?;
         match editor.open_file(&content_path) {
-            Ok(_) => {
+            Ok(child) => {
                 let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
                 let tmp_key = format!("pending_{}", content_path.display());
-                state.window_monitor.track(&tmp_key, &filename);
+                state.window_monitor.track_with_child(&tmp_key, &filename, Some(child));
             }
             Err(e) => tracing::warn!("打开编辑器失败: {e}"),
         }

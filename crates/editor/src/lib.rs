@@ -111,7 +111,8 @@ fn find_windows_editor() -> Option<String> {
         (
             "Typora",
             vec![
-                home.join("Applications").join("Typora").join("Typora.exe"),
+                // Prefer system install (Program Files) over portable/Scoop installs
+                // — portable installs may lack a valid license.
                 std::path::PathBuf::from(&program_files)
                     .join("Typora")
                     .join("Typora.exe"),
@@ -122,6 +123,7 @@ fn find_windows_editor() -> Option<String> {
                     .join("Programs")
                     .join("Typora")
                     .join("Typora.exe"),
+                home.join("Applications").join("Typora").join("Typora.exe"),
             ],
         ),
         (
