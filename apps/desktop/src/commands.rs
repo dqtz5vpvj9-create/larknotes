@@ -7,6 +7,61 @@ fn lock_err(e: impl std::fmt::Display) -> String {
     format!("Internal lock error: {e}")
 }
 
+/// Shared logic: pull remote content into local DB + file.
+/// Used by `pull_doc` and `resolve_conflict("keep_remote")`.
+fn sync_from_remote(
+    state: &AppState,
+    doc_id: &str,
+    content: &str,
+    meta: &mut DocMeta,
+    action: &str,
+) -> Result<(), String> {
+    let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
+    let old_local_path = meta.local_path.as_ref().map(std::path::PathBuf::from);
+
+    std::fs::create_dir_all(docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
+
+    let new_title = extract_title(content);
+    let ideal_path = unique_content_path(&workspace_dir, &new_title);
+
+    // Rename file if title changed
+    let local_path = match &old_local_path {
+        Some(old) if old.exists() && *old != ideal_path => {
+            match std::fs::rename(old, &ideal_path) {
+                Ok(()) => {
+                    tracing::info!("{action}: 文件已重命名 {} → {}", old.display(), ideal_path.display());
+                    ideal_path
+                }
+                Err(e) => {
+                    tracing::warn!("{action}: 重命名文件失败: {e}");
+                    old.clone()
+                }
+            }
+        }
+        Some(old) if old.exists() => old.clone(),
+        _ => ideal_path,
+    };
+
+    // Update DB BEFORE writing file to prevent watcher push-back
+    let hash = hash_content(content.as_bytes());
+    meta.local_path = Some(local_path.to_string_lossy().to_string());
+    meta.content_hash = Some(hash.clone());
+    meta.sync_status = SyncStatus::Synced;
+    meta.title = new_title;
+
+    {
+        let store = state.storage.lock().map_err(lock_err)?;
+        store.upsert_doc(meta).map_err(|e| e.to_string())?;
+        store.add_sync_history(doc_id, action, Some(&hash)).map_err(|e| e.to_string())?;
+        store.save_snapshot(doc_id, content, &hash).map_err(|e| e.to_string())?;
+    }
+
+    // Write file AFTER DB so watcher sees matching hash and skips
+    std::fs::write(&local_path, content).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_auth_status(
     state: tauri::State<'_, AppState>,
@@ -41,7 +96,6 @@ pub async fn create_doc(
     let folder = folder_path.unwrap_or_default();
     let markdown = format!("# {title}");
 
-    // 1. Write local file + open editor IMMEDIATELY (no network wait)
     let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
     let target_dir = if folder.is_empty() {
         docs_dir(&workspace_dir)
@@ -50,30 +104,17 @@ pub async fn create_doc(
     };
     std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
 
-    let content_path = unique_content_path_in(&workspace_dir, &folder, &title);
-    std::fs::write(&content_path, &markdown).map_err(|e| e.to_string())?;
-
-    // Open editor right away — user sees it instantly
-    {
-        let editor = state.editor.read().map_err(lock_err)?;
-        match editor.open_file(&content_path) {
-            Ok(child) => {
-                let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
-                let tmp_key = format!("pending_{}", content_path.display());
-                state.window_monitor.track_with_child(&tmp_key, &filename, Some(child));
-            }
-            Err(e) => tracing::warn!("打开编辑器失败: {e}"),
-        }
-    }
-
-    // 2. Create remote doc (this is the slow part, ~1-2s network call)
+    // 1. Create remote doc first (the slow part, ~1-2s)
     let mut meta = state
         .provider
         .create(&title, &markdown)
         .await
         .map_err(|e| e.to_string())?;
 
-    // 3. Store in DB
+    // 2. Store in DB with the correct hash BEFORE writing the local file.
+    //    This prevents the file watcher from seeing a new file without a
+    //    matching doc_id/hash in the DB and triggering an unwanted sync.
+    let content_path = unique_content_path_in(&workspace_dir, &folder, &title);
     let hash = hash_content(markdown.as_bytes());
     meta.local_path = Some(content_path.to_string_lossy().to_string());
     meta.content_hash = Some(hash);
@@ -87,12 +128,18 @@ pub async fn create_doc(
         .upsert_doc(&meta)
         .map_err(|e| e.to_string())?;
 
-    // Move tracking from temp key to real doc_id
+    // 3. Write local file + open editor
+    std::fs::write(&content_path, &markdown).map_err(|e| e.to_string())?;
+
     {
-        let tmp_key = format!("pending_{}", content_path.display());
-        let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
-        state.window_monitor.untrack(&tmp_key);
-        state.window_monitor.track(&meta.doc_id, &filename);
+        let editor = state.editor.read().map_err(lock_err)?;
+        match editor.open_file(&content_path) {
+            Ok(child) => {
+                let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
+                state.window_monitor.track_with_child(&meta.doc_id, &filename, Some(child));
+            }
+            Err(e) => tracing::warn!("打开编辑器失败: {e}"),
+        }
     }
 
     Ok(meta)
@@ -528,30 +575,15 @@ pub async fn quick_note(
     let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
     std::fs::create_dir_all(docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
 
-    let content_path = unique_content_path(&workspace_dir, &title);
-    std::fs::write(&content_path, &markdown).map_err(|e| e.to_string())?;
-
-    // Open editor immediately
-    {
-        let editor = state.editor.read().map_err(lock_err)?;
-        match editor.open_file(&content_path) {
-            Ok(child) => {
-                let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
-                let tmp_key = format!("pending_{}", content_path.display());
-                state.window_monitor.track_with_child(&tmp_key, &filename, Some(child));
-            }
-            Err(e) => tracing::warn!("打开编辑器失败: {e}"),
-        }
-    }
-
-    // Create remote doc (async, may take 1-2s)
+    // 1. Create remote doc first
     let mut meta = state
         .provider
         .create(&title, &markdown)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Store in DB
+    // 2. DB insert BEFORE file write (prevents watcher race)
+    let content_path = unique_content_path(&workspace_dir, &title);
     let hash = hash_content(markdown.as_bytes());
     meta.local_path = Some(content_path.to_string_lossy().to_string());
     meta.content_hash = Some(hash);
@@ -564,12 +596,18 @@ pub async fn quick_note(
         .upsert_doc(&meta)
         .map_err(|e| e.to_string())?;
 
-    // Move tracking from temp key to real doc_id
+    // 3. Write file + open editor
+    std::fs::write(&content_path, &markdown).map_err(|e| e.to_string())?;
+
     {
-        let tmp_key = format!("pending_{}", content_path.display());
-        let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
-        state.window_monitor.untrack(&tmp_key);
-        state.window_monitor.track(&meta.doc_id, &filename);
+        let editor = state.editor.read().map_err(lock_err)?;
+        match editor.open_file(&content_path) {
+            Ok(child) => {
+                let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
+                state.window_monitor.track_with_child(&meta.doc_id, &filename, Some(child));
+            }
+            Err(e) => tracing::warn!("打开编辑器失败: {e}"),
+        }
     }
 
     Ok(meta)
@@ -604,15 +642,12 @@ pub async fn pull_doc(
     state: tauri::State<'_, AppState>,
     doc_id: String,
 ) -> Result<DocMeta, String> {
-    // 1. Fetch remote content
     let read_output = state
         .provider
         .read(&doc_id)
         .await
         .map_err(|e| e.to_string())?;
-    let content = read_output.content;
 
-    // 2. Get local doc info
     let mut meta = state
         .storage
         .lock()
@@ -621,51 +656,7 @@ pub async fn pull_doc(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "文档不存在".to_string())?;
 
-    let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
-
-    // 3. Determine local file path — rename if title changed
-    let old_local_path = meta.local_path
-        .as_ref()
-        .map(std::path::PathBuf::from);
-
-    std::fs::create_dir_all(larknotes_core::docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
-
-    let new_title = larknotes_core::extract_title(&content);
-    let ideal_path = larknotes_core::unique_content_path(&workspace_dir, &new_title);
-
-    // If we have an existing file and the title changed, rename it
-    let local_path = match &old_local_path {
-        Some(old) if old.exists() && *old != ideal_path => {
-            // Rename file to match new title
-            if let Err(e) = std::fs::rename(old, &ideal_path) {
-                tracing::warn!("pull_doc: 重命名文件失败 {} → {}: {e}", old.display(), ideal_path.display());
-                old.clone() // Keep old path if rename fails
-            } else {
-                tracing::info!("pull_doc: 文件已重命名 {} → {}", old.display(), ideal_path.display());
-                ideal_path
-            }
-        }
-        Some(old) if old.exists() => old.clone(), // Title unchanged, keep path
-        _ => ideal_path, // No existing file, use ideal path
-    };
-
-    // 4. Update DB BEFORE writing file — this prevents the file watcher from
-    //    seeing the change and pushing it back to remote (sync_one checks hash).
-    let hash = hash_content(content.as_bytes());
-    meta.local_path = Some(local_path.to_string_lossy().to_string());
-    meta.content_hash = Some(hash.clone());
-    meta.sync_status = SyncStatus::Synced;
-    meta.title = new_title;
-
-    {
-        let store = state.storage.lock().map_err(lock_err)?;
-        store.upsert_doc(&meta).map_err(|e| e.to_string())?;
-        store.add_sync_history(&doc_id, "pull", Some(&hash)).map_err(|e| e.to_string())?;
-        store.save_snapshot(&doc_id, &content, &hash).map_err(|e| e.to_string())?;
-    }
-
-    // Write file AFTER DB is updated so watcher sees matching hash and skips
-    std::fs::write(&local_path, &content).map_err(|e| e.to_string())?;
+    sync_from_remote(&state, &doc_id, &read_output.content, &mut meta, "pull")?;
 
     Ok(meta)
 }
@@ -751,7 +742,6 @@ pub async fn resolve_conflict(
             .read(&doc_id)
             .await
             .map_err(|e| e.to_string())?;
-        let content = read_output.content;
 
         let mut meta = state
             .storage
@@ -761,47 +751,7 @@ pub async fn resolve_conflict(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "文档不存在".to_string())?;
 
-        let old_local_path = meta.local_path
-            .as_ref()
-            .ok_or_else(|| "本地文件路径不存在，无法写入".to_string())?
-            .clone();
-
-        // Rename file if remote title changed
-        let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
-        let new_title = larknotes_core::extract_title(&content);
-        let ideal_path = larknotes_core::unique_content_path(&workspace_dir, &new_title);
-        let old_path = std::path::PathBuf::from(&old_local_path);
-
-        let local_path = if old_path.exists() && old_path != ideal_path {
-            match std::fs::rename(&old_path, &ideal_path) {
-                Ok(()) => {
-                    tracing::info!("resolve_conflict: 文件已重命名 {} → {}", old_path.display(), ideal_path.display());
-                    ideal_path
-                }
-                Err(e) => {
-                    tracing::warn!("resolve_conflict: 重命名文件失败: {e}");
-                    old_path
-                }
-            }
-        } else {
-            old_path
-        };
-
-        // Update DB BEFORE writing file to prevent watcher push-back
-        let hash = hash_content(content.as_bytes());
-        meta.local_path = Some(local_path.to_string_lossy().to_string());
-        meta.content_hash = Some(hash.clone());
-        meta.sync_status = SyncStatus::Synced;
-        meta.title = new_title;
-
-        {
-            let store = state.storage.lock().map_err(lock_err)?;
-            store.upsert_doc(&meta).map_err(|e| e.to_string())?;
-            store.add_sync_history(&doc_id, "pull", Some(&hash)).map_err(|e| e.to_string())?;
-            store.save_snapshot(&doc_id, &content, &hash).map_err(|e| e.to_string())?;
-        }
-
-        std::fs::write(&local_path, &content).map_err(|e| e.to_string())?;
+        sync_from_remote(&state, &doc_id, &read_output.content, &mut meta, "pull")?;
 
         Ok(meta)
     } else {

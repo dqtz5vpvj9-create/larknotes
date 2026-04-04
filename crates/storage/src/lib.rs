@@ -442,20 +442,27 @@ impl Storage {
     /// Replace the doc_id of an existing document (e.g. after re-creating on remote).
     /// Updates all related tables (documents, sync_history, snapshots).
     pub fn replace_doc_id(&self, old_id: &str, new_id: &str) -> Result<(), LarkNotesError> {
-        self.conn
-            .execute(
-                "UPDATE documents SET doc_id = ?1 WHERE doc_id = ?2",
-                params![new_id, old_id],
-            )
-            .map_err(|e| LarkNotesError::Storage(format!("替换doc_id失败: {e}")))?;
-        let _ = self.conn.execute(
+        // All three updates must succeed or none — use a transaction.
+        let tx = self.conn
+            .unchecked_transaction()
+            .map_err(|e| LarkNotesError::Storage(format!("开始事务失败: {e}")))?;
+        tx.execute(
+            "UPDATE documents SET doc_id = ?1 WHERE doc_id = ?2",
+            params![new_id, old_id],
+        )
+        .map_err(|e| LarkNotesError::Storage(format!("替换doc_id失败: {e}")))?;
+        tx.execute(
             "UPDATE sync_history SET doc_id = ?1 WHERE doc_id = ?2",
             params![new_id, old_id],
-        );
-        let _ = self.conn.execute(
-            "UPDATE snapshots SET doc_id = ?1 WHERE doc_id = ?2",
+        )
+        .map_err(|e| LarkNotesError::Storage(format!("替换sync_history doc_id失败: {e}")))?;
+        tx.execute(
+            "UPDATE version_snapshots SET doc_id = ?1 WHERE doc_id = ?2",
             params![new_id, old_id],
-        );
+        )
+        .map_err(|e| LarkNotesError::Storage(format!("替换version_snapshots doc_id失败: {e}")))?;
+        tx.commit()
+            .map_err(|e| LarkNotesError::Storage(format!("提交事务失败: {e}")))?;
         Ok(())
     }
 

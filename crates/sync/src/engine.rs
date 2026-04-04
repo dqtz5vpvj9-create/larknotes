@@ -212,13 +212,24 @@ impl SyncEngine {
         ];
         // First attempt
         match self.provider.write(doc_id, &content).await {
-            Ok(_write_meta) => {
+            Ok(write_meta) => {
+                tracing::debug!("write 成功: {doc_id}, remote_at={}", write_meta.updated_at);
                 if title_changed {
                     if let Err(e) = self.provider.rename(doc_id, &title).await {
-                        tracing::warn!("重命名失败 (内容已推送): {doc_id}: {e}");
+                        tracing::error!("重命名失败 (内容已推送): {doc_id}: {e}");
+                        // Content is on remote but title is wrong — mark partial failure
+                        if let Ok(store) = self.storage.lock() {
+                            let _ = store.update_content_hash(doc_id, &new_hash);
+                            let _ = store.update_sync_status(
+                                doc_id,
+                                &SyncStatus::Error(format!("标题同步失败: {e}")),
+                            );
+                        }
+                        self.emit_status(doc_id, SyncStatus::Error(format!("标题同步失败: {e}")), None);
+                        return;
                     }
                 }
-                self.mark_synced(doc_id, &new_hash, &title, &content);
+                self.mark_synced(doc_id, &new_hash, &content);
                 return;
             }
             Err(e) => {
@@ -254,14 +265,24 @@ impl SyncEngine {
             tokio::time::sleep(*delay).await;
 
             match self.provider.write(doc_id, &content).await {
-                Ok(_write_meta) => {
+                Ok(write_meta) => {
+                    tracing::debug!("重试 write 成功: {doc_id}, remote_at={}", write_meta.updated_at);
                     if title_changed {
                         if let Err(e) = self.provider.rename(doc_id, &title).await {
-                            tracing::warn!("重试后重命名失败: {doc_id}: {e}");
+                            tracing::error!("重试后重命名失败: {doc_id}: {e}");
+                            if let Ok(store) = self.storage.lock() {
+                                let _ = store.update_content_hash(doc_id, &new_hash);
+                                let _ = store.update_sync_status(
+                                    doc_id,
+                                    &SyncStatus::Error(format!("标题同步失败: {e}")),
+                                );
+                            }
+                            self.emit_status(doc_id, SyncStatus::Error(format!("标题同步失败: {e}")), None);
+                            return;
                         }
                     }
                     tracing::info!("重试成功: {doc_id} (第{}次)", i + 1);
-                    self.mark_synced(doc_id, &new_hash, &title, &content);
+                    self.mark_synced(doc_id, &new_hash, &content);
                     return;
                 }
                 Err(e) => {
@@ -279,7 +300,7 @@ impl SyncEngine {
         self.emit_status(doc_id, SyncStatus::Conflict, None);
     }
 
-    fn mark_synced(&self, doc_id: &str, new_hash: &str, _title: &str, content: &str) {
+    fn mark_synced(&self, doc_id: &str, new_hash: &str, content: &str) {
         if let Ok(store) = self.storage.lock() {
             let _ = store.update_content_hash(doc_id, new_hash);
             let _ = store.update_sync_status(doc_id, &SyncStatus::Synced);
@@ -302,12 +323,19 @@ impl SyncEngine {
                 let new_id = &new_meta.doc_id;
                 tracing::info!("远端重建成功: {old_doc_id} → {new_id}");
                 if let Ok(store) = self.storage.lock() {
-                    let _ = store.replace_doc_id(old_doc_id, new_id);
-                    let _ = store.update_content_hash(new_id, new_hash);
+                    // replace_doc_id is transactional — if it fails, the old doc_id remains intact.
+                    if let Err(e) = store.replace_doc_id(old_doc_id, new_id) {
+                        tracing::error!("重建后替换doc_id失败: {e}");
+                        let _ = store.update_sync_status(old_doc_id, &SyncStatus::Error(format!("DB更新失败: {e}")));
+                        self.emit_status(old_doc_id, SyncStatus::Error(format!("DB更新失败: {e}")), None);
+                        return;
+                    }
+                    if let Err(e) = store.update_content_hash(new_id, new_hash) {
+                        tracing::error!("重建后更新hash失败: {e}");
+                    }
                     let _ = store.update_sync_status(new_id, &SyncStatus::Synced);
                     let _ = store.add_sync_history(new_id, "recreate", Some(new_hash));
                     let _ = store.save_snapshot(new_id, content, new_hash);
-                    // Update the URL if available
                     if !new_meta.url.is_empty() {
                         let _ = store.update_url(new_id, &new_meta.url);
                     }

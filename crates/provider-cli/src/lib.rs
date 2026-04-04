@@ -360,7 +360,7 @@ impl DocProvider for CliProvider {
             .run_cli(&["docs", "+fetch", "--doc", id, "--format", "json"])
             .await?;
         let content = parse_fetch_response(&json);
-        // Build a minimal DocMeta from what we have
+        // Extract available metadata from the fetch response
         let title_raw = json.pointer("/data/title")
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -369,11 +369,19 @@ impl DocProvider for CliProvider {
         } else {
             title_raw.to_string()
         };
+        let url = json.pointer("/data/doc_url")
+            .or_else(|| json.pointer("/data/url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let doc_id_from_resp = json.pointer("/data/doc_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(id);
         let meta = DocMeta {
-            doc_id: id.to_string(),
+            doc_id: doc_id_from_resp.to_string(),
             title,
             doc_type: "DOCX".to_string(),
-            url: String::new(),
+            url,
             owner_name: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -391,10 +399,11 @@ impl DocProvider for CliProvider {
             "--mode", "overwrite",
             "--markdown", content,
         ]).await?;
-        let now = chrono::Local::now().to_rfc3339();
         Ok(WriteMeta {
-            content_hash: String::new(), // CLI doesn't return hash; caller computes locally
-            updated_at: now,
+            // CLI doesn't return a server-side hash; the caller (sync engine)
+            // computes its own local hash and uses that for change detection.
+            content_hash: String::new(),
+            updated_at: chrono::Local::now().to_rfc3339(),
         })
     }
 
@@ -417,14 +426,13 @@ impl DocProvider for CliProvider {
     }
 
     async fn rename(&self, id: &str, new_name: &str) -> Result<(), LarkNotesError> {
-        // lark-cli +update in overwrite mode requires --markdown content.
-        // Read the current content first to preserve it while renaming.
-        let current = self.read(id).await?;
+        // Use append mode with a single space — harmless in Markdown, avoids
+        // reading + re-uploading the entire document just to change the title.
         self.run_cli(&[
             "docs", "+update", "--doc", id,
-            "--mode", "overwrite",
+            "--mode", "append",
             "--new-title", new_name,
-            "--markdown", &current.content,
+            "--markdown", " ",
         ]).await?;
         Ok(())
     }
