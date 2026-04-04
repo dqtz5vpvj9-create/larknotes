@@ -87,7 +87,15 @@ fn main() {
                 }
             }
 
-            // 3b. Startup path reconciliation: fix orphaned docs from
+            // 3b. Scan folder tree and register subfolders in DB
+            {
+                let count = larknotes_sync::scan_folder_tree(&workspace_dir, &storage);
+                if count > 0 {
+                    tracing::info!("启动时注册了 {} 个文件夹", count);
+                }
+            }
+
+            // 3c. Startup path reconciliation: fix orphaned docs from
             //     external renames while app was not running
             {
                 let matches = larknotes_sync::reconcile_paths(&workspace_dir, &storage);
@@ -111,8 +119,8 @@ fn main() {
                 if let Ok(Some(editor)) = store.get_config("editor_command") {
                     config.editor_command = editor;
                 }
-                if let Ok(Some(cli_path)) = store.get_config("lark_cli_path") {
-                    config.lark_cli_path = cli_path;
+                if let Ok(Some(cli_path)) = store.get_config("provider_cli_path") {
+                    config.provider_cli_path = cli_path;
                 }
                 if let Ok(Some(ws)) = store.get_config("workspace_dir") {
                     let p = std::path::PathBuf::from(&ws);
@@ -138,13 +146,15 @@ fn main() {
             std::fs::create_dir_all(workspace.join(".meta"))?;
 
             // 4. Read config values before wrapping in Arc
-            let cli_path = config.lark_cli_path.clone();
+            let cli_path = config.provider_cli_path.clone();
             let editor_command = config.editor_command.clone();
             let debounce_ms = Arc::new(AtomicU64::new(config.sync_debounce_ms));
             let config = Arc::new(RwLock::new(config));
 
             // 5. Init provider
-            let provider = Arc::new(CliProvider::new(&cli_path));
+            let cli_provider = Arc::new(CliProvider::new(&cli_path));
+            let provider: Arc<dyn DocProvider> = cli_provider.clone();
+            let auth: Arc<dyn ProviderAuth> = cli_provider.clone();
 
             // 6. Init editor
             let editor = Arc::new(RwLock::new(EditorLauncher::new(&editor_command)));
@@ -152,7 +162,7 @@ fn main() {
             // 7. Init sync channel + engine
             let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel();
             let (sync_engine, _status_rx) = SyncEngine::new(
-                provider.clone() as Arc<dyn DocProvider>,
+                provider.clone(),
                 storage.clone(),
                 workspace.clone(),
                 debounce_ms.clone(),
@@ -160,9 +170,19 @@ fn main() {
             let sync_engine = Arc::new(sync_engine);
 
             // 8. Start file watcher — stored in app managed state to prevent drop
-            let watcher = FileWatcher::new(workspace, sync_tx.clone(), storage.clone())
-                .expect("Failed to start file watcher");
+            let (docs_changed_tx, mut docs_changed_rx) = tokio::sync::mpsc::unbounded_channel();
+            let watcher = FileWatcher::with_notify(
+                workspace, sync_tx.clone(), storage.clone(), Some(docs_changed_tx),
+            ).expect("Failed to start file watcher");
             app.manage(watcher);
+
+            // 8b. Relay watcher rename notifications → frontend "docs-changed"
+            let rename_handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                while docs_changed_rx.recv().await.is_some() {
+                    let _ = rename_handle.emit("docs-changed", ());
+                }
+            });
 
             // 9. Spawn sync engine + status relay
             let engine = sync_engine.clone();
@@ -263,12 +283,14 @@ fn main() {
             let shutdown_tx = sync_tx.clone();
             app.manage(AppState {
                 provider,
+                auth,
                 storage,
                 sync_tx,
                 config,
                 editor,
                 debounce_ms,
                 window_monitor,
+                cli_provider,
             });
             app.manage(ShutdownSender(Mutex::new(Some(shutdown_tx))));
 
@@ -300,10 +322,15 @@ fn main() {
             pull_doc,
             set_sync_debounce,
             set_auto_sync,
-            set_lark_cli_path,
+            set_provider_cli_path,
             open_login_url,
             resolve_conflict,
             get_conflict_diff,
+            get_folder_tree,
+            create_folder,
+            rename_folder,
+            delete_folder,
+            move_doc_to_folder,
         ])
         .build(tauri::generate_context!())
         .expect("error while building LarkNotes")

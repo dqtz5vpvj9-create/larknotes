@@ -9,6 +9,14 @@ export interface DocMeta {
   local_path: string | null;
   content_hash: string | null;
   sync_status: SyncStatus;
+  folder_path: string;
+}
+
+export interface FolderTreeNode {
+  name: string;
+  path: string;
+  children: FolderTreeNode[];
+  doc_count: number;
 }
 
 export type SyncStatus =
@@ -29,7 +37,7 @@ export interface AuthStatus {
 export interface AppConfig {
   workspace_dir: string;
   editor_command: string;
-  lark_cli_path: string;
+  provider_cli_path: string;
   sync_debounce_ms: number;
   auto_sync: boolean;
 }

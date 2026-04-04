@@ -11,7 +11,7 @@ fn lock_err(e: impl std::fmt::Display) -> String {
 pub async fn get_auth_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<AuthStatus, String> {
-    state.provider.auth_status().await.map_err(|e| e.to_string())
+    state.auth.auth_status().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -21,7 +21,7 @@ pub async fn search_docs(
 ) -> Result<Vec<DocMeta>, String> {
     state
         .provider
-        .search_docs(&query)
+        .search(&query)
         .await
         .map_err(|e| e.to_string())
 }
@@ -30,19 +30,27 @@ pub async fn search_docs(
 pub async fn create_doc(
     state: tauri::State<'_, AppState>,
     title: String,
+    #[allow(unused_variables)]
+    folder_path: Option<String>,
 ) -> Result<DocMeta, String> {
     let title = if title.is_empty() {
         "Untitled".to_string()
     } else {
         title
     };
+    let folder = folder_path.unwrap_or_default();
     let markdown = format!("# {title}");
 
     // 1. Write local file + open editor IMMEDIATELY (no network wait)
     let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
-    std::fs::create_dir_all(docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
+    let target_dir = if folder.is_empty() {
+        docs_dir(&workspace_dir)
+    } else {
+        docs_dir(&workspace_dir).join(&folder)
+    };
+    std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
 
-    let content_path = unique_content_path(&workspace_dir, &title);
+    let content_path = unique_content_path_in(&workspace_dir, &folder, &title);
     std::fs::write(&content_path, &markdown).map_err(|e| e.to_string())?;
 
     // Open editor right away — user sees it instantly
@@ -61,7 +69,7 @@ pub async fn create_doc(
     // 2. Create remote doc (this is the slow part, ~1-2s network call)
     let mut meta = state
         .provider
-        .create_doc(&title, &markdown)
+        .create(&title, &markdown)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -70,6 +78,7 @@ pub async fn create_doc(
     meta.local_path = Some(content_path.to_string_lossy().to_string());
     meta.content_hash = Some(hash);
     meta.sync_status = SyncStatus::Synced;
+    meta.folder_path = folder;
 
     state
         .storage
@@ -112,11 +121,12 @@ pub async fn open_doc_in_editor(
         path
     } else {
         // Fetch from remote and save with title-based filename
-        let content = state
+        let read_output = state
             .provider
-            .fetch_doc(&doc_id)
+            .read(&doc_id)
             .await
             .map_err(|e| e.to_string())?;
+        let content = read_output.content;
 
         std::fs::create_dir_all(docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
 
@@ -329,11 +339,12 @@ pub async fn import_doc(
     doc_id: String,
 ) -> Result<DocMeta, String> {
     // 1. Fetch content from remote
-    let content = state
+    let read_output = state
         .provider
-        .fetch_doc(&doc_id)
+        .read(&doc_id)
         .await
         .map_err(|e| e.to_string())?;
+    let content = read_output.content;
 
     let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
     std::fs::create_dir_all(docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
@@ -342,7 +353,7 @@ pub async fn import_doc(
     let title = extract_title(&content);
     let search_results = state
         .provider
-        .search_docs(&title)
+        .search(&title)
         .await
         .unwrap_or_default();
     let remote_meta = search_results.iter().find(|d| d.doc_id == doc_id);
@@ -364,6 +375,7 @@ pub async fn import_doc(
         local_path: Some(content_path.to_string_lossy().to_string()),
         content_hash: Some(hash),
         sync_status: SyncStatus::Synced,
+        folder_path: String::new(),
     };
 
     state
@@ -396,7 +408,7 @@ pub async fn delete_doc(
 ) -> Result<(), String> {
     // Try remote delete first (unless user already confirmed local-only)
     if !force_local.unwrap_or(false) {
-        if let Err(e) = state.provider.delete_doc(&doc_id).await {
+        if let Err(e) = state.provider.delete(&doc_id).await {
             // Return error with a prefix so frontend can distinguish and show confirm dialog
             return Err(format!("REMOTE_DELETE_FAILED:{e}"));
         }
@@ -535,7 +547,7 @@ pub async fn quick_note(
     // Create remote doc (async, may take 1-2s)
     let mut meta = state
         .provider
-        .create_doc(&title, &markdown)
+        .create(&title, &markdown)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -593,11 +605,12 @@ pub async fn pull_doc(
     doc_id: String,
 ) -> Result<DocMeta, String> {
     // 1. Fetch remote content
-    let content = state
+    let read_output = state
         .provider
-        .fetch_doc(&doc_id)
+        .read(&doc_id)
         .await
         .map_err(|e| e.to_string())?;
+    let content = read_output.content;
 
     // 2. Get local doc info
     let mut meta = state
@@ -701,18 +714,18 @@ pub async fn set_auto_sync(
 }
 
 #[tauri::command]
-pub async fn set_lark_cli_path(
+pub async fn set_provider_cli_path(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
-    state.config.write().map_err(lock_err)?.lark_cli_path = path.clone();
+    state.config.write().map_err(lock_err)?.provider_cli_path = path.clone();
     // Update the running CLI provider immediately
-    state.provider.set_cli_path(&path);
+    state.cli_provider.set_cli_path(&path);
     state
         .storage
         .lock()
         .map_err(lock_err)?
-        .set_config("lark_cli_path", &path)
+        .set_config("provider_cli_path", &path)
         .map_err(|e| e.to_string())
 }
 
@@ -720,7 +733,7 @@ pub async fn set_lark_cli_path(
 pub async fn open_login_url(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    let cli_path = state.config.read().map_err(lock_err)?.lark_cli_path.clone();
+    let cli_path = state.config.read().map_err(lock_err)?.provider_cli_path.clone();
     // Return the command the user needs to run
     Ok(format!("{} auth login", cli_path))
 }
@@ -733,11 +746,12 @@ pub async fn resolve_conflict(
 ) -> Result<DocMeta, String> {
     if resolution == "keep_remote" {
         // Pull remote content and overwrite local
-        let content = state
+        let read_output = state
             .provider
-            .fetch_doc(&doc_id)
+            .read(&doc_id)
             .await
             .map_err(|e| e.to_string())?;
+        let content = read_output.content;
 
         let mut meta = state
             .storage
@@ -808,7 +822,7 @@ pub async fn resolve_conflict(
 
         state
             .provider
-            .update_doc(&doc_id, &content)
+            .write(&doc_id, &content)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -846,11 +860,212 @@ pub async fn get_conflict_diff(
     };
 
     // Get remote content
-    let remote_content = state
-        .provider
-        .fetch_doc(&doc_id)
-        .await
-        .unwrap_or_default();
+    let remote_content = match state.provider.read(&doc_id).await {
+        Ok(output) => output.content,
+        Err(_) => String::new(),
+    };
 
     Ok((local_content, remote_content))
+}
+
+// ─── Folder commands ──────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct FolderTreeNode {
+    pub name: String,
+    pub path: String,
+    pub children: Vec<FolderTreeNode>,
+    pub doc_count: usize,
+}
+
+#[tauri::command]
+pub fn get_folder_tree(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<FolderTreeNode>, String> {
+    let store = state.storage.lock().map_err(lock_err)?;
+    let folders = store.list_folders().map_err(|e| e.to_string())?;
+    let all_docs = store.list_docs().map_err(|e| e.to_string())?;
+
+    // Count docs per folder
+    let mut doc_counts = std::collections::HashMap::new();
+    for doc in &all_docs {
+        *doc_counts.entry(doc.folder_path.clone()).or_insert(0usize) += 1;
+    }
+
+    // Build tree from flat list of folder paths
+    let mut root_children: Vec<FolderTreeNode> = Vec::new();
+
+    for folder in &folders {
+        let parts: Vec<&str> = folder.folder_path.split('/').collect();
+        insert_into_tree(&mut root_children, &parts, 0, &folder.folder_path, &doc_counts);
+    }
+
+    Ok(root_children)
+}
+
+fn insert_into_tree(
+    nodes: &mut Vec<FolderTreeNode>,
+    parts: &[&str],
+    depth: usize,
+    full_path: &str,
+    doc_counts: &std::collections::HashMap<String, usize>,
+) {
+    if depth >= parts.len() {
+        return;
+    }
+    let name = parts[depth];
+    let partial_path: String = parts[..=depth].join("/");
+
+    let idx = nodes.iter().position(|n| n.name == name);
+    let node = if let Some(i) = idx {
+        &mut nodes[i]
+    } else {
+        let count = doc_counts.get(&partial_path).copied().unwrap_or(0);
+        nodes.push(FolderTreeNode {
+            name: name.to_string(),
+            path: partial_path.clone(),
+            children: Vec::new(),
+            doc_count: count,
+        });
+        nodes.last_mut().unwrap()
+    };
+
+    if depth + 1 < parts.len() {
+        insert_into_tree(&mut node.children, parts, depth + 1, full_path, doc_counts);
+    }
+}
+
+#[tauri::command]
+pub fn create_folder(
+    state: tauri::State<'_, AppState>,
+    folder_path: String,
+) -> Result<(), String> {
+    let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
+    let abs_path = docs_dir(&workspace_dir).join(&folder_path);
+    std::fs::create_dir_all(&abs_path).map_err(|e| e.to_string())?;
+
+    state
+        .storage
+        .lock()
+        .map_err(lock_err)?
+        .upsert_folder(&folder_path, None)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn rename_folder(
+    state: tauri::State<'_, AppState>,
+    old_path: String,
+    new_path: String,
+) -> Result<(), String> {
+    let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
+    let docs = docs_dir(&workspace_dir);
+    let abs_old = docs.join(&old_path);
+    let abs_new = docs.join(&new_path);
+
+    std::fs::rename(&abs_old, &abs_new).map_err(|e| e.to_string())?;
+
+    // DB updates (folder + child folder paths + document folder_path + local_path)
+    let store = state.storage.lock().map_err(lock_err)?;
+    store.rename_folder(&old_path, &new_path).map_err(|e| e.to_string())?;
+
+    // Update local_path for affected docs
+    if let Ok(all_docs) = store.list_docs() {
+        for doc in &all_docs {
+            if let Some(ref lp) = doc.local_path {
+                let lp_path = std::path::Path::new(lp);
+                if lp_path.starts_with(&abs_old) {
+                    if let Ok(suffix) = lp_path.strip_prefix(&abs_old) {
+                        let new_lp = abs_new.join(suffix).to_string_lossy().to_string();
+                        let _ = store.update_local_path(&doc.doc_id, &new_lp);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_folder(
+    state: tauri::State<'_, AppState>,
+    folder_path: String,
+) -> Result<(), String> {
+    let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
+    let abs_path = docs_dir(&workspace_dir).join(&folder_path);
+
+    // Only delete if empty
+    if abs_path.exists() {
+        let is_empty = std::fs::read_dir(&abs_path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if !is_empty {
+            return Err("文件夹不为空，无法删除".to_string());
+        }
+        std::fs::remove_dir(&abs_path).map_err(|e| e.to_string())?;
+    }
+
+    state
+        .storage
+        .lock()
+        .map_err(lock_err)?
+        .delete_folder(&folder_path)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn move_doc_to_folder(
+    state: tauri::State<'_, AppState>,
+    doc_id: String,
+    target_folder: String,
+) -> Result<(), String> {
+    let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
+    let store = state.storage.lock().map_err(lock_err)?;
+
+    let doc = store
+        .get_doc(&doc_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("文档不存在: {doc_id}"))?;
+
+    let old_path = doc
+        .local_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .ok_or("文档没有本地文件")?;
+
+    if !old_path.exists() {
+        return Err("本地文件不存在".to_string());
+    }
+
+    // Target directory
+    let target_dir = if target_folder.is_empty() {
+        docs_dir(&workspace_dir)
+    } else {
+        docs_dir(&workspace_dir).join(&target_folder)
+    };
+    std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+
+    let filename = old_path.file_name().ok_or("无法获取文件名")?;
+    let new_path = target_dir.join(filename);
+
+    if new_path == old_path {
+        return Ok(()); // Already in target folder
+    }
+
+    std::fs::rename(&old_path, &new_path).map_err(|e| e.to_string())?;
+
+    let new_path_str = new_path.to_string_lossy().to_string();
+    store
+        .update_local_path(&doc_id, &new_path_str)
+        .map_err(|e| e.to_string())?;
+    store
+        .update_folder_path(&doc_id, &target_folder)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
 }

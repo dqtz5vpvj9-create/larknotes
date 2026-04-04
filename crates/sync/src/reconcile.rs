@@ -20,6 +20,12 @@ pub enum ReconcileMethod {
     TitleMatch,
 }
 
+/// Extract a display title from a filename by stripping the `.md` extension.
+fn title_from_filename(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    Some(stem.to_string())
+}
+
 /// Reconcile orphan docs (DB local_path doesn't exist on disk) with orphan files
 /// (untracked .md files in docs/ dir). This handles:
 /// - External renames while app was not running (startup reconciliation)
@@ -74,25 +80,21 @@ pub fn reconcile_paths(
         return Vec::new();
     }
 
-    // Find orphan files: .md files in docs/ that are NOT in any doc's local_path
+    // Find orphan files: .md files in docs/ (recursively) that are NOT in any doc's local_path
     // Also skip conflict files
-    let orphan_files: Vec<PathBuf> = match std::fs::read_dir(&docs_path) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                let is_md = p.extension().and_then(|e| e.to_str()) == Some("md");
-                let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let is_conflict = fname.contains(".conflict-");
-                let is_known = known_paths.contains(&p.to_string_lossy().to_string());
-                is_md && !is_conflict && !is_known
-            })
-            .collect(),
-        Err(e) => {
-            tracing::error!("reconcile_paths: read_dir failed: {e}");
-            return Vec::new();
-        }
-    };
+    let orphan_files: Vec<PathBuf> = walkdir::WalkDir::new(&docs_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| {
+            let is_md = p.extension().and_then(|e| e.to_str()) == Some("md");
+            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let is_conflict = fname.contains(".conflict-");
+            let is_known = known_paths.contains(&p.to_string_lossy().to_string());
+            is_md && !is_conflict && !is_known
+        })
+        .collect();
 
     if orphan_files.is_empty() {
         tracing::info!(
@@ -122,6 +124,13 @@ pub fn reconcile_paths(
                                 doc.doc_id
                             );
                             continue;
+                        }
+                        // Update title from new filename so UI reflects the rename
+                        let new_title = title_from_filename(file_path);
+                        if let Some(ref t) = new_title {
+                            if t != &doc.title {
+                                let _ = store.update_title(&doc.doc_id, t);
+                            }
                         }
                         tracing::info!(
                             "reconcile_paths: matched doc {} by content hash → {}",
@@ -169,6 +178,13 @@ pub fn reconcile_paths(
                         continue;
                     }
                     let _ = store.update_content_hash(&doc.doc_id, &new_hash);
+                    // Update title from new filename so UI reflects the rename
+                    let new_title = title_from_filename(file_path);
+                    if let Some(ref t) = new_title {
+                        if t != &doc.title {
+                            let _ = store.update_title(&doc.doc_id, t);
+                        }
+                    }
                     tracing::info!(
                         "reconcile_paths: matched doc {} by title '{}' → {}",
                         doc.doc_id,
@@ -197,6 +213,61 @@ pub fn reconcile_paths(
     }
 
     matches
+}
+
+/// Scan the docs/ directory tree and register all subfolders in the DB.
+/// Also updates folder_path for any documents whose local_path is in a subfolder.
+/// Called at app startup.
+pub fn scan_folder_tree(
+    workspace: &Path,
+    storage: &Arc<Mutex<Storage>>,
+) -> usize {
+    let docs_path = docs_dir(workspace);
+    if !docs_path.exists() {
+        return 0;
+    }
+
+    let store = match storage.lock() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("scan_folder_tree: storage lock poisoned: {e}");
+            return 0;
+        }
+    };
+
+    let mut count = 0;
+    for entry in walkdir::WalkDir::new(&docs_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_dir() && entry.path() != docs_path {
+            if let Ok(rel) = entry.path().strip_prefix(&docs_path) {
+                let folder_path = rel.to_string_lossy().replace('\\', "/");
+                let _ = store.upsert_folder(&folder_path, None);
+                count += 1;
+            }
+        }
+    }
+
+    // Update folder_path for documents based on their local_path
+    if let Ok(all_docs) = store.list_docs() {
+        for doc in &all_docs {
+            if let Some(ref lp) = doc.local_path {
+                let lp_path = Path::new(lp);
+                if lp_path.exists() {
+                    let folder = folder_of(workspace, lp_path);
+                    if folder != doc.folder_path {
+                        let _ = store.update_folder_path(&doc.doc_id, &folder);
+                    }
+                }
+            }
+        }
+    }
+
+    if count > 0 {
+        tracing::info!("scan_folder_tree: registered {count} folder(s)");
+    }
+    count
 }
 
 /// Rename local files whose filename doesn't match their content title.
@@ -249,7 +320,9 @@ pub fn rename_stale_paths(
         let content_title = extract_title(&content);
 
         // Check if filename already matches the content title
-        let expected_path = titled_content_path(workspace, &content_title);
+        // Use the doc's folder so rename stays in the same subfolder
+        let folder = &doc.folder_path;
+        let expected_path = titled_content_path_in(workspace, folder, &content_title);
         if old_path == expected_path {
             // Filename matches. Still update DB title if it's stale.
             if doc.title != content_title {
@@ -258,8 +331,8 @@ pub fn rename_stale_paths(
             continue;
         }
 
-        // Compute a safe target path (avoids collisions)
-        let new_path = unique_content_path(workspace, &content_title);
+        // Compute a safe target path (avoids collisions), staying in the same folder
+        let new_path = unique_content_path_in(workspace, folder, &content_title);
 
         // Update DB atomically: title + path, then rename file
         if let Err(e) = store.update_title(&doc.doc_id, &content_title) {
@@ -336,6 +409,7 @@ mod tests {
             local_path: local_path.map(|s| s.to_string()),
             content_hash: content_hash.map(|s| s.to_string()),
             sync_status: SyncStatus::Synced,
+            folder_path: String::new(),
         };
         storage.lock().unwrap().upsert_doc(&meta).unwrap();
     }

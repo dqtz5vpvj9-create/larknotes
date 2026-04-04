@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import {
     setEditor, setWorkspace, detectEditors, pickFolder,
-    getAutostartStatus, setAutostart, setSyncDebounce, setAutoSync, setLarkCliPath,
+    getAutostartStatus, setAutostart, setSyncDebounce, setAutoSync, setProviderCliPath,
   } from "../api";
 
   interface Props {
@@ -10,7 +10,7 @@
     workspacePath: string;
     syncDebounceMs: number;
     autoSync: boolean;
-    larkCliPath: string;
+    providerCliPath: string;
     onClose: () => void;
     onEditorChange: (editor: string) => void;
     onWorkspaceChange: (path: string) => void;
@@ -19,7 +19,7 @@
   }
 
   let {
-    editorCommand, workspacePath, syncDebounceMs, autoSync, larkCliPath,
+    editorCommand, workspacePath, syncDebounceMs, autoSync, providerCliPath,
     onClose, onEditorChange, onWorkspaceChange, onConfigChange, onError,
   }: Props = $props();
 
@@ -37,7 +37,7 @@
   $effect(() => { workspaceInput = workspacePath; });
   $effect(() => { debounceInput = syncDebounceMs; });
   $effect(() => { autoSyncInput = autoSync; });
-  $effect(() => { cliPathInput = larkCliPath; });
+  $effect(() => { cliPathInput = providerCliPath; });
 
   onMount(async () => {
     try {
@@ -99,9 +99,9 @@
         await setAutoSync(autoSyncInput);
         onConfigChange("auto_sync", autoSyncInput);
       }
-      if (cliPathInput !== larkCliPath) {
-        await setLarkCliPath(cliPathInput);
-        onConfigChange("lark_cli_path", cliPathInput);
+      if (cliPathInput !== providerCliPath) {
+        await setProviderCliPath(cliPathInput);
+        onConfigChange("provider_cli_path", cliPathInput);
       }
       onClose();
     } catch (e) {
@@ -120,7 +120,7 @@
     || workspaceInput !== workspacePath
     || debounceInput !== syncDebounceMs
     || autoSyncInput !== autoSync
-    || cliPathInput !== larkCliPath
+    || cliPathInput !== providerCliPath
   );
 </script>
 

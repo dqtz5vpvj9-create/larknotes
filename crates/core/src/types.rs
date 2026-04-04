@@ -13,6 +13,29 @@ pub struct DocMeta {
     pub local_path: Option<String>,
     pub content_hash: Option<String>,
     pub sync_status: SyncStatus,
+    /// Relative folder path under docs/, e.g. "项目A/周报". Empty string = root.
+    #[serde(default)]
+    pub folder_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderInfo {
+    pub folder_path: String,
+    pub remote_id: Option<String>,
+}
+
+/// Content + metadata returned by `DocProvider::read()`.
+#[derive(Debug, Clone)]
+pub struct ReadOutput {
+    pub content: String,
+    pub meta: DocMeta,
+}
+
+/// Post-write metadata returned by `DocProvider::write()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteMeta {
+    pub content_hash: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,7 +67,7 @@ pub struct AuthStatus {
 pub struct AppConfig {
     pub workspace_dir: PathBuf,
     pub editor_command: String,
-    pub lark_cli_path: String,
+    pub provider_cli_path: String,
     pub sync_debounce_ms: u64,
     pub auto_sync: bool,
 }
@@ -57,7 +80,7 @@ impl Default for AppConfig {
         Self {
             workspace_dir,
             editor_command: "notepad".to_string(),
-            lark_cli_path: "lark-cli".to_string(),
+            provider_cli_path: "lark-cli".to_string(),
             sync_debounce_ms: 2000,
             auto_sync: true,
         }
@@ -82,29 +105,52 @@ pub struct VersionSnapshot {
     pub created_at: String,
 }
 
-// ─── Flat file layout ───────────────────────────────────────
+// ─── File layout ─────────────────────────────────────────────
 // workspace/
-//   docs/          ← user-visible: <title>.md files live here
-//   .meta/         ← hidden: <doc_id>.json mapping files
-//   app.db         ← SQLite metadata
+//   docs/              ← user-visible: <title>.md files, may contain subfolders
+//     project-a/       ← subfolder (tracked in `folders` table)
+//       note.md
+//   .meta/             ← hidden: <doc_id>.json mapping files
+//   app.db             ← SQLite metadata
 
 /// Returns the docs directory: `workspace/docs/`
 pub fn docs_dir(workspace: &Path) -> PathBuf {
     workspace.join("docs")
 }
 
-/// Returns the content file path: `workspace/docs/<title>.md`
+/// Returns the content file path: `workspace/docs/[folder/]<title>.md`
 /// This is a pure mapping — does NOT check for duplicates.
+/// Pass `folder = ""` for the root docs directory.
 pub fn titled_content_path(workspace: &Path, title: &str) -> PathBuf {
+    titled_content_path_in(workspace, "", title)
+}
+
+/// Like `titled_content_path` but within a specific subfolder.
+pub fn titled_content_path_in(workspace: &Path, folder: &str, title: &str) -> PathBuf {
     let safe_name = sanitize_filename(title);
-    docs_dir(workspace).join(format!("{safe_name}.md"))
+    let dir = if folder.is_empty() {
+        docs_dir(workspace)
+    } else {
+        docs_dir(workspace).join(folder)
+    };
+    dir.join(format!("{safe_name}.md"))
 }
 
 /// Returns a unique content file path, appending ` (2)`, ` (3)` etc. if the
 /// file already exists — matching Windows Explorer behaviour.
+/// Pass `folder = ""` for the root docs directory.
 pub fn unique_content_path(workspace: &Path, title: &str) -> PathBuf {
+    unique_content_path_in(workspace, "", title)
+}
+
+/// Like `unique_content_path` but within a specific subfolder.
+pub fn unique_content_path_in(workspace: &Path, folder: &str, title: &str) -> PathBuf {
     let safe_name = sanitize_filename(title);
-    let dir = docs_dir(workspace);
+    let dir = if folder.is_empty() {
+        docs_dir(workspace)
+    } else {
+        docs_dir(workspace).join(folder)
+    };
     let base = dir.join(format!("{safe_name}.md"));
     if !base.exists() {
         return base;
@@ -123,6 +169,20 @@ pub fn unique_content_path(workspace: &Path, title: &str) -> PathBuf {
             .unwrap_or_default()
             .as_millis()
     ))
+}
+
+/// Extract the relative folder path of a file under `docs/`.
+/// Returns `""` if the file is directly in `docs/`.
+/// Example: `docs/project-a/note.md` → `"project-a"`
+pub fn folder_of(workspace: &Path, file_path: &Path) -> String {
+    let docs = docs_dir(workspace);
+    if let Ok(rel) = file_path.strip_prefix(&docs) {
+        if let Some(parent) = rel.parent() {
+            let s = parent.to_string_lossy().replace('\\', "/");
+            return s.to_string();
+        }
+    }
+    String::new()
 }
 
 /// Sanitize a string to be safe as a filename.
@@ -257,7 +317,7 @@ mod tests {
         let cfg = AppConfig::default();
         assert!(cfg.workspace_dir.to_string_lossy().contains("LarkNotes"));
         assert_eq!(cfg.editor_command, "notepad");
-        assert_eq!(cfg.lark_cli_path, "lark-cli");
+        assert_eq!(cfg.provider_cli_path, "lark-cli");
         assert_eq!(cfg.sync_debounce_ms, 2000);
         assert!(cfg.auto_sync);
     }
@@ -362,5 +422,35 @@ mod tests {
     fn test_titled_content_path_empty_title() {
         let p = titled_content_path(Path::new("/w"), "");
         assert_eq!(p, PathBuf::from("/w/docs/Untitled.md"));
+    }
+
+    #[test]
+    fn test_titled_content_path_in_subfolder() {
+        let p = titled_content_path_in(Path::new("/w"), "project-a", "note");
+        assert_eq!(p, PathBuf::from("/w/docs/project-a/note.md"));
+    }
+
+    #[test]
+    fn test_titled_content_path_in_root() {
+        let p = titled_content_path_in(Path::new("/w"), "", "note");
+        assert_eq!(p, PathBuf::from("/w/docs/note.md"));
+    }
+
+    #[test]
+    fn test_folder_of_root() {
+        let f = folder_of(Path::new("/w"), Path::new("/w/docs/note.md"));
+        assert_eq!(f, "");
+    }
+
+    #[test]
+    fn test_folder_of_subfolder() {
+        let f = folder_of(Path::new("/w"), Path::new("/w/docs/project-a/note.md"));
+        assert_eq!(f, "project-a");
+    }
+
+    #[test]
+    fn test_folder_of_nested() {
+        let f = folder_of(Path::new("/w"), Path::new("/w/docs/a/b/c/note.md"));
+        assert_eq!(f, "a/b/c");
     }
 }

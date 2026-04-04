@@ -4,9 +4,9 @@
   import {
     getAuthStatus, getDocList, getAppConfig, createDoc, manualSync,
     importDoc, deleteDoc, revealInExplorer, openDocInEditor, quickNote,
-    pullDoc,
+    pullDoc, getFolderTree, createFolder as apiCreateFolder,
   } from "./lib/api";
-  import type { AuthStatus, DocMeta, AppConfig, SyncStatusUpdate } from "./lib/types";
+  import type { AuthStatus, DocMeta, AppConfig, SyncStatusUpdate, FolderTreeNode } from "./lib/types";
   import Toolbar from "./lib/components/Toolbar.svelte";
   import DocList from "./lib/components/DocList.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
@@ -17,6 +17,7 @@
   import DocHistory from "./lib/components/DocHistory.svelte";
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import ConflictResolver from "./lib/components/ConflictResolver.svelte";
+  import FolderTree from "./lib/components/FolderTree.svelte";
 
   // ─── Toast system ──────────────────────────────────
   interface ToastMessage {
@@ -48,6 +49,9 @@
   let theme = $state<"dark" | "light">("dark");
   let searchQuery = $state("");
   let filterConflicts = $state(false);
+  let currentFolder = $state("");
+  let folderTree = $state<FolderTreeNode[]>([]);
+  let sidebarCollapsed = $state(false);
 
   // ─── Panel/modal visibility ────────────────────────
   let showSettings = $state(false);
@@ -71,11 +75,19 @@
     docs.filter((d) => d.sync_status.type === "Syncing").length
   );
 
-  let displayDocs = $derived(
-    filterConflicts
-      ? docs.filter((d) => d.sync_status.type === "Conflict" || d.sync_status.type === "Error")
-      : docs
-  );
+  let displayDocs = $derived.by(() => {
+    let filtered = docs;
+    if (filterConflicts) {
+      filtered = filtered.filter((d) => d.sync_status.type === "Conflict" || d.sync_status.type === "Error");
+    }
+    // Filter by current folder (empty string = show all)
+    if (currentFolder !== "" || !filterConflicts) {
+      filtered = filtered.filter((d) => (d.folder_path ?? "") === currentFolder);
+    }
+    return filtered;
+  });
+
+  let rootDocCount = $derived(docs.filter((d) => (d.folder_path ?? "") === "").length);
 
   // ─── Document actions ──────────────────────────────
   async function handleCreate(title: string) {
@@ -83,13 +95,43 @@
     creating = true;
     showCreate = false;
     try {
-      await createDoc(title);
+      await createDoc(title, currentFolder || undefined);
       docs = await getDocList();
+      refreshFolderTree();
       addToast(`「${title}」已创建`, "success");
     } catch (e) {
       addToast(`创建失败: ${e}`);
     } finally {
       creating = false;
+    }
+  }
+
+  async function refreshFolderTree() {
+    try { folderTree = await getFolderTree(); } catch {}
+  }
+
+  async function handleCreateFolder(parentPath: string) {
+    const name = prompt("文件夹名称:");
+    if (!name) return;
+    const path = parentPath ? `${parentPath}/${name}` : name;
+    try {
+      await apiCreateFolder(path);
+      await refreshFolderTree();
+    } catch (e) {
+      addToast(`创建文件夹失败: ${e}`);
+    }
+  }
+
+  async function handleDeleteFolder(path: string) {
+    try {
+      const { deleteFolder } = await import("./lib/api");
+      await deleteFolder(path);
+      if (currentFolder === path || currentFolder.startsWith(path + "/")) {
+        currentFolder = "";
+      }
+      await refreshFolderTree();
+    } catch (e) {
+      addToast(`删除文件夹失败: ${e}`);
     }
   }
 
@@ -131,6 +173,40 @@
   function handleDeleteDoc(docId: string) {
     const doc = docs.find((d) => d.doc_id === docId);
     deleteConfirm = { docId, title: doc?.title ?? "未知文档" };
+  }
+
+  function handleBatchDelete(docIds: string[]) {
+    batchDeleteIds = docIds;
+  }
+
+  function handleBatchSync(docIds: string[]) {
+    for (const id of docIds) {
+      handleSyncDoc(id);
+    }
+  }
+
+  let batchDeleteIds = $state<string[] | null>(null);
+
+  async function confirmBatchDelete() {
+    if (!batchDeleteIds) return;
+    const ids = batchDeleteIds;
+    batchDeleteIds = null;
+    let successCount = 0;
+    let failCount = 0;
+    for (const docId of ids) {
+      try {
+        await deleteDoc(docId);
+        docs = docs.filter((d) => d.doc_id !== docId);
+        successCount++;
+      } catch {
+        failCount++;
+      }
+    }
+    if (failCount > 0) {
+      addToast(`已删除 ${successCount} 篇，${failCount} 篇失败`);
+    } else {
+      addToast(`已删除 ${successCount} 篇文档`, "success");
+    }
   }
 
   async function confirmDelete() {
@@ -263,15 +339,17 @@
     // Initialize data
     (async () => {
       try {
-        const [authResult, docsResult, configResult] = await Promise.allSettled([
+        const [authResult, docsResult, configResult, folderResult] = await Promise.allSettled([
           getAuthStatus(),
           getDocList(),
           getAppConfig(),
+          getFolderTree(),
         ]);
 
         if (authResult.status === "fulfilled") auth = authResult.value;
         if (docsResult.status === "fulfilled") docs = docsResult.value;
         if (configResult.status === "fulfilled") config = configResult.value;
+        if (folderResult.status === "fulfilled") folderTree = folderResult.value;
       } catch (e) {
         addToast(`初始化失败: ${e}`);
       } finally {
@@ -299,6 +377,7 @@
     listen("docs-changed", async () => {
       try {
         docs = await getDocList();
+        refreshFolderTree();
       } catch (e) {
         console.error("Failed to refresh docs:", e);
       }
@@ -392,7 +471,7 @@
             workspacePath={config?.workspace_dir ?? ""}
             syncDebounceMs={config?.sync_debounce_ms ?? 2000}
             autoSync={config?.auto_sync ?? true}
-            larkCliPath={config?.lark_cli_path ?? "lark-cli"}
+            providerCliPath={config?.provider_cli_path ?? "lark-cli"}
             onClose={() => (showSettings = false)}
             onEditorChange={(e) => {
               if (config) config = { ...config, editor_command: e };
@@ -407,18 +486,48 @@
           />
         </div>
       {:else}
-        <DocList
-          docs={displayDocs}
-          {searchQuery}
-          onError={(msg) => addToast(msg)}
-          onSync={handleSyncDoc}
-          onPull={handlePullDoc}
-          onImport={handleImportDoc}
-          onDelete={handleDeleteDoc}
-          onReveal={handleRevealInExplorer}
-          onShowHistory={(id) => (historyDocId = id)}
-          onResolveConflict={(id) => (conflictDocId = id)}
-        />
+        <div class="main-layout">
+          <aside class="sidebar" class:sidebar--collapsed={sidebarCollapsed}>
+            <div class="sidebar-header">
+              <span class="sidebar-title">文件夹</span>
+              <button class="sidebar-toggle" onclick={() => (sidebarCollapsed = !sidebarCollapsed)} title={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}>
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                  {#if sidebarCollapsed}
+                    <path d="M5 3l4 4-4 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+                  {:else}
+                    <path d="M9 3L5 7l4 4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+                  {/if}
+                </svg>
+              </button>
+            </div>
+            {#if !sidebarCollapsed}
+              <FolderTree
+                tree={folderTree}
+                {currentFolder}
+                {rootDocCount}
+                onSelectFolder={(path) => (currentFolder = path)}
+                onCreateFolder={handleCreateFolder}
+                onDeleteFolder={handleDeleteFolder}
+              />
+            {/if}
+          </aside>
+          <div class="doc-list-area">
+            <DocList
+              docs={displayDocs}
+              {searchQuery}
+              onError={(msg) => addToast(msg)}
+              onSync={handleSyncDoc}
+              onPull={handlePullDoc}
+              onImport={handleImportDoc}
+              onDelete={handleDeleteDoc}
+              onReveal={handleRevealInExplorer}
+              onShowHistory={(id) => (historyDocId = id)}
+              onResolveConflict={(id) => (conflictDocId = id)}
+              onBatchDelete={handleBatchDelete}
+              onBatchSync={handleBatchSync}
+            />
+          </div>
+        </div>
       {/if}
     </div>
 
@@ -446,6 +555,17 @@
       danger={true}
       onConfirm={confirmDelete}
       onCancel={() => (deleteConfirm = null)}
+    />
+  {/if}
+
+  {#if batchDeleteIds}
+    <ConfirmDialog
+      title="批量删除"
+      message={`确定删除选中的 ${batchDeleteIds.length} 篇文档？将同时删除本地文件和飞书云端文档。`}
+      confirmLabel={`删除 ${batchDeleteIds.length} 篇`}
+      danger={true}
+      onConfirm={confirmBatchDelete}
+      onCancel={() => (batchDeleteIds = null)}
     />
   {/if}
 
@@ -534,6 +654,62 @@
     flex-direction: column;
     overflow: hidden;
     position: relative;
+  }
+  .main-layout {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+  .sidebar {
+    display: flex;
+    flex-direction: column;
+    width: 200px;
+    min-width: 200px;
+    border-right: 1px solid var(--c-border);
+    overflow: hidden;
+    transition: width 150ms ease, min-width 150ms ease;
+  }
+  .sidebar--collapsed {
+    width: 36px;
+    min-width: 36px;
+  }
+  .sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 8px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--c-text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    flex-shrink: 0;
+  }
+  .sidebar--collapsed .sidebar-title {
+    display: none;
+  }
+  .sidebar-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border: none;
+    background: transparent;
+    color: var(--c-text-tertiary);
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: color 60ms ease;
+  }
+  .sidebar-toggle:hover {
+    color: var(--c-text);
+  }
+  .doc-list-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-width: 0;
   }
   .settings-panel {
     flex: 1;

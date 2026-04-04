@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AuthStatus, DocMeta, AppConfig, SyncHistoryEntry, VersionSnapshot } from "./types";
+import type { AuthStatus, DocMeta, AppConfig, SyncHistoryEntry, VersionSnapshot, FolderTreeNode } from "./types";
 
 export const getAuthStatus = () =>
   invoke<AuthStatus>("get_auth_status");
@@ -10,8 +10,8 @@ export const searchDocs = (query: string) =>
 export const searchDocsLocal = (query: string) =>
   invoke<DocMeta[]>("search_docs_local", { query });
 
-export const createDoc = (title: string) =>
-  invoke<DocMeta>("create_doc", { title });
+export const createDoc = (title: string, folderPath?: string) =>
+  invoke<DocMeta>("create_doc", { title, folderPath: folderPath ?? null });
 
 export const openDocInEditor = (docId: string) =>
   invoke<void>("open_doc_in_editor", { docId });
@@ -73,8 +73,8 @@ export const setSyncDebounce = (ms: number) =>
 export const setAutoSync = (enabled: boolean) =>
   invoke<void>("set_auto_sync", { enabled });
 
-export const setLarkCliPath = (path: string) =>
-  invoke<void>("set_lark_cli_path", { path });
+export const setProviderCliPath = (path: string) =>
+  invoke<void>("set_provider_cli_path", { path });
 
 export const openLoginUrl = () =>
   invoke<string>("open_login_url");
@@ -84,3 +84,18 @@ export const resolveConflict = (docId: string, resolution: string) =>
 
 export const getConflictDiff = (docId: string) =>
   invoke<[string, string]>("get_conflict_diff", { docId });
+
+export const getFolderTree = () =>
+  invoke<FolderTreeNode[]>("get_folder_tree");
+
+export const createFolder = (folderPath: string) =>
+  invoke<void>("create_folder", { folderPath });
+
+export const renameFolder = (oldPath: string, newPath: string) =>
+  invoke<void>("rename_folder", { oldPath, newPath });
+
+export const deleteFolder = (folderPath: string) =>
+  invoke<void>("delete_folder", { folderPath });
+
+export const moveDocToFolder = (docId: string, targetFolder: string) =>
+  invoke<void>("move_doc_to_folder", { docId, targetFolder });

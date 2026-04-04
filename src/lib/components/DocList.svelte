@@ -15,19 +15,26 @@
     onReveal?: (docId: string) => void;
     onShowHistory?: (docId: string) => void;
     onResolveConflict?: (docId: string) => void;
+    onBatchDelete?: (docIds: string[]) => void;
+    onBatchSync?: (docIds: string[]) => void;
   }
 
   let {
     docs, searchQuery = "", onError, onSync, onPull, onImport,
     onDelete, onReveal, onShowHistory, onResolveConflict,
+    onBatchDelete, onBatchSync,
   }: Props = $props();
 
   let openingId = $state<string | null>(null);
   let contextMenu = $state<{ x: number; y: number; doc: DocMeta } | null>(null);
   let sortField = $state<SortField>("updated_at");
   let sortDirection = $state<SortDirection>("desc");
+  let batchMode = $state(false);
+  let selected = $state<Set<string>>(new Set());
 
   let sortedDocs = $derived(sortDocs(docs, sortField, sortDirection));
+  let selectedCount = $derived(selected.size);
+  let allSelected = $derived(sortedDocs.length > 0 && selected.size === sortedDocs.length);
 
   function toggleSort(field: SortField) {
     if (sortField === field) {
@@ -38,7 +45,37 @@
     }
   }
 
+  function toggleBatchMode() {
+    batchMode = !batchMode;
+    if (!batchMode) selected = new Set();
+  }
+
+  function toggleSelect(docId: string) {
+    const next = new Set(selected);
+    if (next.has(docId)) next.delete(docId); else next.add(docId);
+    selected = next;
+  }
+
+  function toggleSelectAll() {
+    if (allSelected) {
+      selected = new Set();
+    } else {
+      selected = new Set(sortedDocs.map(d => d.doc_id));
+    }
+  }
+
+  function handleBatchDelete() {
+    if (selectedCount === 0) return;
+    onBatchDelete?.([...selected]);
+  }
+
+  function handleBatchSync() {
+    if (selectedCount === 0) return;
+    onBatchSync?.([...selected]);
+  }
+
   async function handleOpen(doc: DocMeta) {
+    if (batchMode) { toggleSelect(doc.doc_id); return; }
     if (openingId) return;
     openingId = doc.doc_id;
     try {
@@ -137,18 +174,38 @@
     </div>
   {:else}
     <div class="list-header">
-      {#if searchQuery}
-        <span class="search-count">找到 {docs.length} 篇文档</span>
-      {/if}
-      <div class="sort-bar">
-        <button class="sort-btn" class:sort-btn--active={sortField === "updated_at"} onclick={() => toggleSort("updated_at")}>
-          时间{sortArrow("updated_at")}
-        </button>
+      <div class="header-left">
+        {#if batchMode}
+          <label class="batch-checkbox-label">
+            <input type="checkbox" class="batch-checkbox" checked={allSelected} onchange={toggleSelectAll} />
+          </label>
+        {/if}
         <button class="sort-btn" class:sort-btn--active={sortField === "title"} onclick={() => toggleSort("title")}>
           标题{sortArrow("title")}
         </button>
+        {#if searchQuery}
+          <span class="search-count">({docs.length} 篇)</span>
+        {/if}
+      </div>
+      <div class="header-right">
+        {#if batchMode && selectedCount > 0}
+          <div class="batch-actions">
+            <button class="batch-btn batch-btn--sync" onclick={handleBatchSync}>
+              同步 ({selectedCount})
+            </button>
+            <button class="batch-btn batch-btn--danger" onclick={handleBatchDelete}>
+              删除 ({selectedCount})
+            </button>
+          </div>
+        {/if}
+        <button class="sort-btn" class:sort-btn--active={sortField === "updated_at"} onclick={() => toggleSort("updated_at")}>
+          时间{sortArrow("updated_at")}
+        </button>
         <button class="sort-btn" class:sort-btn--active={sortField === "sync_status"} onclick={() => toggleSort("sync_status")}>
           状态{sortArrow("sync_status")}
+        </button>
+        <button class="manage-btn" class:manage-btn--active={batchMode} onclick={toggleBatchMode}>
+          {batchMode ? "完成" : "管理"}
         </button>
       </div>
     </div>
@@ -157,7 +214,8 @@
         <div
           class="doc-row"
           class:doc-row--warn={isWarning(doc.sync_status.type)}
-          class:doc-row--opening={openingId === doc.doc_id}
+          class:doc-row--opening={!batchMode && openingId === doc.doc_id}
+          class:doc-row--selected={batchMode && selected.has(doc.doc_id)}
           role="button"
           tabindex="0"
           onclick={() => handleOpen(doc)}
@@ -169,7 +227,13 @@
             <div class="doc-accent-bar" style="background: {syncStatusColor(doc.sync_status.type)};"></div>
           {/if}
 
-          <div class="doc-status-dot" style="background: {syncStatusColor(doc.sync_status.type)};"></div>
+          {#if batchMode}
+            <label class="batch-checkbox-label" onclick={(e: MouseEvent) => e.stopPropagation()}>
+              <input type="checkbox" class="batch-checkbox" checked={selected.has(doc.doc_id)} onchange={() => toggleSelect(doc.doc_id)} />
+            </label>
+          {:else}
+            <div class="doc-status-dot" style="background: {syncStatusColor(doc.sync_status.type)};"></div>
+          {/if}
 
           <div class="doc-info">
             <span class="doc-title">
@@ -182,7 +246,7 @@
               {/if}
             </span>
             <span class="doc-meta">
-              {#if doc.owner_name}{doc.owner_name} · {/if}{formatRelativeTime(doc.updated_at)}{#if doc.created_at} · 创建于 {formatShortDate(doc.created_at)}{/if}
+              {formatRelativeTime(doc.updated_at)}{#if doc.created_at} · {formatShortDate(doc.created_at)}{/if}
             </span>
           </div>
 
@@ -192,16 +256,18 @@
             </span>
           </div>
 
-          <button
-            class="doc-action"
-            onclick={(e: MouseEvent) => { e.stopPropagation(); onSync(doc.doc_id); }}
-            title="推送同步"
-          >
-            <svg width="14" height="14" viewBox="0 0 15 15" fill="none">
-              <path d="M2.5 7.5a5 5 0 019-3M12.5 7.5a5 5 0 01-9 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-              <path d="M11.5 1.5v3h-3M3.5 13.5v-3h3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </button>
+          {#if !batchMode}
+            <button
+              class="doc-action"
+              onclick={(e: MouseEvent) => { e.stopPropagation(); onSync(doc.doc_id); }}
+              title="推送同步"
+            >
+              <svg width="14" height="14" viewBox="0 0 15 15" fill="none">
+                <path d="M2.5 7.5a5 5 0 019-3M12.5 7.5a5 5 0 01-9 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+                <path d="M11.5 1.5v3h-3M3.5 13.5v-3h3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          {/if}
         </div>
       {/each}
     </div>
@@ -261,22 +327,31 @@
     border: 1px solid var(--c-accent-border, rgba(212,165,71,0.15));
   }
 
-  /* List header / sort bar */
+  /* List header — matches doc-row column layout */
   .list-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding: 4px 10px 2px;
+    gap: 10px;
+  }
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+  }
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
   }
   .search-count {
     font-size: 11px;
     color: var(--c-text-tertiary);
     letter-spacing: 0.02em;
-  }
-  .sort-bar {
-    display: flex;
-    gap: 2px;
-    margin-left: auto;
   }
   .sort-btn {
     padding: 2px 8px;
@@ -297,6 +372,76 @@
   .sort-btn--active {
     color: var(--c-accent);
     font-weight: 600;
+  }
+  .manage-btn {
+    padding: 2px 10px;
+    border: 1px solid var(--c-border, rgba(0,0,0,0.08));
+    outline: none;
+    background: transparent;
+    color: var(--c-text-tertiary);
+    font-size: 11px;
+    font-family: var(--font-sans);
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: all var(--transition);
+    margin-left: 4px;
+  }
+  .manage-btn:hover {
+    color: var(--c-text-secondary);
+    background: var(--c-bg-hover);
+  }
+  .manage-btn--active {
+    color: var(--c-accent);
+    border-color: var(--c-accent);
+    font-weight: 500;
+  }
+
+  /* Batch actions */
+  .batch-actions {
+    display: flex;
+    gap: 4px;
+    margin-right: 8px;
+  }
+  .batch-btn {
+    padding: 2px 10px;
+    border: none;
+    outline: none;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    font-family: var(--font-sans);
+    font-weight: 500;
+    cursor: pointer;
+    transition: all var(--transition);
+  }
+  .batch-btn--sync {
+    background: var(--c-accent-bg, rgba(212,165,71,0.1));
+    color: var(--c-accent);
+  }
+  .batch-btn--sync:hover {
+    background: var(--c-accent-bg, rgba(212,165,71,0.2));
+  }
+  .batch-btn--danger {
+    background: rgba(212,91,91,0.08);
+    color: #d45b5b;
+  }
+  .batch-btn--danger:hover {
+    background: rgba(212,91,91,0.15);
+  }
+
+  /* Batch checkbox */
+  .batch-checkbox-label {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    flex-shrink: 0;
+  }
+  .batch-checkbox {
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: var(--c-accent);
   }
 
   /* List */
@@ -330,6 +475,9 @@
     opacity: 0.6;
     pointer-events: none;
   }
+  .doc-row--selected {
+    background: var(--c-accent-bg, rgba(212,165,71,0.06));
+  }
 
   /* Warning rows get a left accent bar */
   .doc-row--warn {
@@ -360,10 +508,12 @@
     flex: 1;
     min-width: 0;
     display: flex;
-    flex-direction: column;
-    gap: 2px;
+    align-items: baseline;
+    gap: 12px;
   }
   .doc-title {
+    flex: 1;
+    min-width: 0;
     font-size: 13px;
     font-weight: 500;
     color: var(--c-text);
@@ -373,9 +523,11 @@
     letter-spacing: -0.01em;
   }
   .doc-meta {
+    flex-shrink: 0;
     font-size: 11px;
     color: var(--c-text-tertiary);
     letter-spacing: 0.01em;
+    white-space: nowrap;
   }
   .doc-badge {
     flex-shrink: 0;

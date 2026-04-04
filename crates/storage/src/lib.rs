@@ -76,6 +76,17 @@ impl Storage {
                 -- Add remote_hash column if upgrading from v0
                 ALTER TABLE documents ADD COLUMN remote_hash TEXT;
             "),
+            (3, "
+                ALTER TABLE documents ADD COLUMN folder_path TEXT NOT NULL DEFAULT '';
+                CREATE TABLE IF NOT EXISTS folders (
+                    folder_path TEXT PRIMARY KEY,
+                    remote_token TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+            "),
+            (4, "
+                ALTER TABLE folders RENAME COLUMN remote_token TO remote_id;
+            "),
         ];
 
         for (version, sql) in &migrations {
@@ -108,8 +119,8 @@ impl Storage {
             .execute(
                 "INSERT OR REPLACE INTO documents
                  (doc_id, title, doc_type, url, owner_name, created_at, updated_at,
-                  local_path, content_hash, sync_status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  local_path, content_hash, sync_status, folder_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     meta.doc_id,
                     meta.title,
@@ -121,6 +132,7 @@ impl Storage {
                     meta.local_path,
                     meta.content_hash,
                     sync_status_str,
+                    meta.folder_path,
                 ],
             )
             .map_err(|e| LarkNotesError::Storage(format!("写入文档失败: {e}")))?;
@@ -131,7 +143,7 @@ impl Storage {
         self.conn
             .query_row(
                 "SELECT doc_id, title, doc_type, url, owner_name, created_at, updated_at,
-                        local_path, content_hash, sync_status
+                        local_path, content_hash, sync_status, folder_path
                  FROM documents WHERE doc_id = ?1",
                 params![doc_id],
                 |row| Ok(row_to_doc_meta(row)),
@@ -145,7 +157,7 @@ impl Storage {
             .conn
             .prepare(
                 "SELECT doc_id, title, doc_type, url, owner_name, created_at, updated_at,
-                        local_path, content_hash, sync_status
+                        local_path, content_hash, sync_status, folder_path
                  FROM documents ORDER BY updated_at DESC",
             )
             .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?;
@@ -391,7 +403,7 @@ impl Storage {
             .conn
             .prepare(
                 "SELECT doc_id, title, doc_type, url, owner_name, created_at, updated_at,
-                        local_path, content_hash, sync_status
+                        local_path, content_hash, sync_status, folder_path
                  FROM documents WHERE title LIKE ?1 ESCAPE '\\' COLLATE NOCASE
                  ORDER BY updated_at DESC",
             )
@@ -417,13 +429,160 @@ impl Storage {
         Ok(())
     }
 
+    pub fn update_url(&self, doc_id: &str, url: &str) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "UPDATE documents SET url = ?1 WHERE doc_id = ?2",
+                params![url, doc_id],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("更新URL失败: {e}")))?;
+        Ok(())
+    }
+
+    /// Replace the doc_id of an existing document (e.g. after re-creating on remote).
+    /// Updates all related tables (documents, sync_history, snapshots).
+    pub fn replace_doc_id(&self, old_id: &str, new_id: &str) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "UPDATE documents SET doc_id = ?1 WHERE doc_id = ?2",
+                params![new_id, old_id],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("替换doc_id失败: {e}")))?;
+        let _ = self.conn.execute(
+            "UPDATE sync_history SET doc_id = ?1 WHERE doc_id = ?2",
+            params![new_id, old_id],
+        );
+        let _ = self.conn.execute(
+            "UPDATE snapshots SET doc_id = ?1 WHERE doc_id = ?2",
+            params![new_id, old_id],
+        );
+        Ok(())
+    }
+
+    // ─── Folder operations ──────────────────────────────
+
+    pub fn update_folder_path(&self, doc_id: &str, folder_path: &str) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "UPDATE documents SET folder_path = ?1 WHERE doc_id = ?2",
+                params![folder_path, doc_id],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("更新文件夹路径失败: {e}")))?;
+        Ok(())
+    }
+
+    pub fn list_docs_in_folder(&self, folder_path: &str) -> Result<Vec<DocMeta>, LarkNotesError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT doc_id, title, doc_type, url, owner_name, created_at, updated_at,
+                        local_path, content_hash, sync_status, folder_path
+                 FROM documents WHERE folder_path = ?1
+                 ORDER BY updated_at DESC",
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?;
+
+        let docs = stmt
+            .query_map(params![folder_path], |row| Ok(row_to_doc_meta(row)))
+            .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(docs)
+    }
+
+    pub fn upsert_folder(
+        &self,
+        folder_path: &str,
+        remote_id: Option<&str>,
+    ) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO folders (folder_path, remote_id) VALUES (?1, ?2)",
+                params![folder_path, remote_id],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("写入文件夹失败: {e}")))?;
+        Ok(())
+    }
+
+    pub fn delete_folder(&self, folder_path: &str) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "DELETE FROM folders WHERE folder_path = ?1",
+                params![folder_path],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("删除文件夹失败: {e}")))?;
+        Ok(())
+    }
+
+    pub fn list_folders(&self) -> Result<Vec<FolderInfo>, LarkNotesError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT folder_path, remote_id FROM folders ORDER BY folder_path")
+            .map_err(|e| LarkNotesError::Storage(format!("查询文件夹失败: {e}")))?;
+
+        let folders = stmt
+            .query_map([], |row| {
+                Ok(FolderInfo {
+                    folder_path: row.get(0)?,
+                    remote_id: row.get(1)?,
+                })
+            })
+            .map_err(|e| LarkNotesError::Storage(format!("查询文件夹失败: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(folders)
+    }
+
+    /// Rename all folder entries and update documents when a folder is renamed.
+    pub fn rename_folder(&self, old_path: &str, new_path: &str) -> Result<usize, LarkNotesError> {
+        // Update the folder itself
+        self.conn
+            .execute(
+                "UPDATE folders SET folder_path = ?1 WHERE folder_path = ?2",
+                params![new_path, old_path],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("重命名文件夹失败: {e}")))?;
+
+        // Update child folders (prefix match)
+        let old_prefix = format!("{old_path}/");
+        let new_prefix = format!("{new_path}/");
+        self.conn
+            .execute(
+                "UPDATE folders SET folder_path = ?1 || SUBSTR(folder_path, ?2)
+                 WHERE folder_path LIKE ?3 || '%'",
+                params![new_prefix, old_prefix.len() as i64 + 1, old_prefix],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("重命名子文件夹失败: {e}")))?;
+
+        // Update documents in this folder
+        let doc_count = self.conn
+            .execute(
+                "UPDATE documents SET folder_path = ?1 WHERE folder_path = ?2",
+                params![new_path, old_path],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("更新文档文件夹失败: {e}")))?;
+
+        // Update documents in child folders
+        self.conn
+            .execute(
+                "UPDATE documents SET folder_path = ?1 || SUBSTR(folder_path, ?2)
+                 WHERE folder_path LIKE ?3 || '%'",
+                params![new_prefix, old_prefix.len() as i64 + 1, old_prefix],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("更新子文档文件夹失败: {e}")))?;
+
+        Ok(doc_count)
+    }
+
     /// Get all documents that have local_path set (for pull checking)
     pub fn list_synced_docs(&self) -> Result<Vec<DocMeta>, LarkNotesError> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT doc_id, title, doc_type, url, owner_name, created_at, updated_at,
-                        local_path, content_hash, sync_status
+                        local_path, content_hash, sync_status, folder_path
                  FROM documents WHERE local_path IS NOT NULL
                  ORDER BY updated_at DESC",
             )
@@ -455,6 +614,7 @@ fn row_to_doc_meta(row: &rusqlite::Row) -> DocMeta {
         local_path: row.get(7).unwrap_or_default(),
         content_hash: row.get(8).unwrap_or_default(),
         sync_status,
+        folder_path: row.get(10).unwrap_or_default(),
     }
 }
 
@@ -478,6 +638,7 @@ mod tests {
             local_path: None,
             content_hash: None,
             sync_status: SyncStatus::Synced,
+            folder_path: String::new(),
         }
     }
 
@@ -903,5 +1064,80 @@ mod tests {
         let s = test_storage();
         // Should not error
         s.delete_doc("nonexistent").unwrap();
+    }
+
+    // ─── Folder operations ──────────────────────────────
+
+    #[test]
+    fn test_folder_crud() {
+        let s = test_storage();
+        s.upsert_folder("project-a", None).unwrap();
+        s.upsert_folder("project-a/sub", Some("fld_abc")).unwrap();
+
+        let folders = s.list_folders().unwrap();
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0].folder_path, "project-a");
+        assert!(folders[0].remote_id.is_none());
+        assert_eq!(folders[1].folder_path, "project-a/sub");
+        assert_eq!(folders[1].remote_id.as_deref(), Some("fld_abc"));
+
+        s.delete_folder("project-a/sub").unwrap();
+        assert_eq!(s.list_folders().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_doc_folder_path() {
+        let s = test_storage();
+        let mut doc = sample_doc("d1");
+        doc.folder_path = "project-a".to_string();
+        s.upsert_doc(&doc).unwrap();
+
+        let fetched = s.get_doc("d1").unwrap().unwrap();
+        assert_eq!(fetched.folder_path, "project-a");
+
+        // list_docs_in_folder
+        let in_root = s.list_docs_in_folder("").unwrap();
+        assert!(in_root.is_empty());
+        let in_project = s.list_docs_in_folder("project-a").unwrap();
+        assert_eq!(in_project.len(), 1);
+        assert_eq!(in_project[0].doc_id, "d1");
+    }
+
+    #[test]
+    fn test_update_folder_path() {
+        let s = test_storage();
+        s.upsert_doc(&sample_doc("d1")).unwrap();
+        assert_eq!(s.get_doc("d1").unwrap().unwrap().folder_path, "");
+
+        s.update_folder_path("d1", "new-folder").unwrap();
+        assert_eq!(s.get_doc("d1").unwrap().unwrap().folder_path, "new-folder");
+    }
+
+    #[test]
+    fn test_rename_folder() {
+        let s = test_storage();
+        s.upsert_folder("old", None).unwrap();
+        s.upsert_folder("old/child", None).unwrap();
+
+        let mut d1 = sample_doc("d1");
+        d1.folder_path = "old".to_string();
+        s.upsert_doc(&d1).unwrap();
+
+        let mut d2 = sample_doc("d2");
+        d2.folder_path = "old/child".to_string();
+        s.upsert_doc(&d2).unwrap();
+
+        s.rename_folder("old", "new").unwrap();
+
+        // Folders renamed
+        let folders = s.list_folders().unwrap();
+        let paths: Vec<&str> = folders.iter().map(|f| f.folder_path.as_str()).collect();
+        assert!(paths.contains(&"new"));
+        assert!(paths.contains(&"new/child"));
+        assert!(!paths.contains(&"old"));
+
+        // Documents updated
+        assert_eq!(s.get_doc("d1").unwrap().unwrap().folder_path, "new");
+        assert_eq!(s.get_doc("d2").unwrap().unwrap().folder_path, "new/child");
     }
 }

@@ -20,6 +20,18 @@ impl LarkNotesError {
     /// Returns true for transient errors that may succeed on retry
     /// (network timeouts, 5xx server errors, CLI launch failures).
     /// Returns false for permanent errors (401, 404, auth failures).
+    /// Returns true if the error indicates the remote resource was not found
+    /// (deleted or never existed). Used to trigger re-creation.
+    pub fn is_not_found(&self) -> bool {
+        let msg = self.to_string().to_lowercase();
+        msg.contains("404")
+            || msg.contains("not found")
+            || msg.contains("不存在")
+            || msg.contains("deleted")
+            || msg.contains("已删除")
+            || msg.contains("no such")
+    }
+
     pub fn is_transient(&self) -> bool {
         let msg = self.to_string().to_lowercase();
         // Permanent errors
@@ -177,5 +189,43 @@ mod tests {
             assert_eq!(json["kind"], expected_kind, "wrong kind for {err}");
             assert!(json["message"].is_string(), "message not string for {err}");
         }
+    }
+
+    // ─── is_not_found() comprehensive ───────────────────
+
+    // #29: is_not_found covers all expected patterns
+    #[test]
+    fn test_is_not_found_comprehensive() {
+        // Should match
+        assert!(LarkNotesError::Cli("404 not found".into()).is_not_found());
+        assert!(LarkNotesError::Cli("document not found".into()).is_not_found());
+        assert!(LarkNotesError::Cli("文档不存在".into()).is_not_found());
+        assert!(LarkNotesError::Cli("file_token不存在".into()).is_not_found());
+        assert!(LarkNotesError::Cli("document has been deleted".into()).is_not_found());
+        assert!(LarkNotesError::Cli("文档已删除".into()).is_not_found());
+        assert!(LarkNotesError::Cli("no such document".into()).is_not_found());
+
+        // Should NOT match
+        assert!(!LarkNotesError::Cli("permission denied".into()).is_not_found());
+        assert!(!LarkNotesError::Cli("connection timeout".into()).is_not_found());
+        assert!(!LarkNotesError::Cli("rate limit exceeded".into()).is_not_found());
+        assert!(!LarkNotesError::Cli("internal server error".into()).is_not_found());
+    }
+
+    // #30: is_transient covers expected patterns
+    #[test]
+    fn test_is_transient_comprehensive() {
+        // Transient (should retry)
+        assert!(LarkNotesError::Cli("connection timeout".into()).is_transient());
+        assert!(LarkNotesError::Cli("network unreachable".into()).is_transient());
+        assert!(LarkNotesError::Other("502 bad gateway".into()).is_transient());
+        assert!(LarkNotesError::Other("503 service unavailable".into()).is_transient());
+
+        // NOT transient (permanent errors)
+        assert!(!LarkNotesError::Cli("401 unauthorized".into()).is_transient());
+        assert!(!LarkNotesError::Cli("403 forbidden".into()).is_transient());
+        assert!(!LarkNotesError::Cli("404 not found".into()).is_transient());
+        assert!(!LarkNotesError::Cli("permission denied".into()).is_transient());
+        assert!(!LarkNotesError::Auth("token expired".into()).is_transient());
     }
 }
