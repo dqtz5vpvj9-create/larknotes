@@ -4,7 +4,7 @@
   import {
     getAuthStatus, getDocList, getAppConfig, createDoc, manualSync,
     importDoc, deleteDoc, revealInExplorer, openDocInEditor, quickNote,
-    pullDoc, getFolderTree, createFolder as apiCreateFolder,
+    pullDoc, getFolderTree, createFolder as apiCreateFolder, renameDoc,
   } from "./lib/api";
   import type { AuthStatus, DocMeta, AppConfig, SyncStatusUpdate, FolderTreeNode } from "./lib/types";
   import Toolbar from "./lib/components/Toolbar.svelte";
@@ -32,9 +32,11 @@
   function addToast(text: string, type: "error" | "success" | "info" = "error") {
     const id = ++toastId;
     toasts = [...toasts, { id, text, type }];
+    // Scale error duration with message length so long messages aren't cut off
+    const duration = type === "error" ? Math.max(6000, Math.min(text.length * 80, 15000)) : 3000;
     setTimeout(() => {
       toasts = toasts.filter((t) => t.id !== id);
-    }, type === "error" ? 6000 : 3000);
+    }, duration);
   }
 
   function dismissToast(id: number) {
@@ -80,8 +82,9 @@
     if (filterConflicts) {
       filtered = filtered.filter((d) => d.sync_status.type === "Conflict" || d.sync_status.type === "Error");
     }
-    // Filter by current folder (empty string = show all)
-    if (currentFolder !== "" || !filterConflicts) {
+    // Only apply folder filter when user has explicitly selected a folder.
+    // When currentFolder is "" (no folder selected), show all docs.
+    if (currentFolder !== "") {
       filtered = filtered.filter((d) => (d.folder_path ?? "") === currentFolder);
     }
     return filtered;
@@ -173,6 +176,19 @@
   function handleDeleteDoc(docId: string) {
     const doc = docs.find((d) => d.doc_id === docId);
     deleteConfirm = { docId, title: doc?.title ?? "未知文档" };
+  }
+
+  async function handleRenameDoc(docId: string) {
+    const doc = docs.find((d) => d.doc_id === docId);
+    const newTitle = prompt("请输入新标题", doc?.title ?? "");
+    if (!newTitle || newTitle === doc?.title) return;
+    try {
+      const updated = await renameDoc(docId, newTitle);
+      docs = docs.map((d) => (d.doc_id === docId ? updated : d));
+      addToast(`已重命名为「${newTitle}」`, "success");
+    } catch (e: any) {
+      addToast(`重命名失败: ${e}`, "error");
+    }
   }
 
   function handleBatchDelete(docIds: string[]) {
@@ -359,10 +375,15 @@
 
     // Listen for sync status updates from backend
     listen<SyncStatusUpdate>("sync-status", (event) => {
-      const { doc_id, status, title } = event.payload;
+      const { doc_id, status, title, new_doc_id } = event.payload;
       docs = docs.map((d) => {
         if (d.doc_id === doc_id) {
-          return { ...d, sync_status: status, title: title ?? d.title };
+          return {
+            ...d,
+            doc_id: new_doc_id ?? d.doc_id,
+            sync_status: status,
+            title: title ?? d.title,
+          };
         }
         return d;
       });
@@ -520,6 +541,7 @@
               onPull={handlePullDoc}
               onImport={handleImportDoc}
               onDelete={handleDeleteDoc}
+              onRename={handleRenameDoc}
               onReveal={handleRevealInExplorer}
               onShowHistory={(id) => (historyDocId = id)}
               onResolveConflict={(id) => (conflictDocId = id)}

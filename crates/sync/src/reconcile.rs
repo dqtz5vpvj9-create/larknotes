@@ -41,21 +41,21 @@ pub fn reconcile_paths(
         return Vec::new();
     }
 
-    let store = match storage.lock() {
-        Ok(s) => s,
+    // Clone doc list under brief lock, then release — file I/O must not hold the lock.
+    let all_docs = match storage.lock() {
+        Ok(store) => match store.list_docs() {
+            Ok(docs) => docs,
+            Err(e) => {
+                tracing::error!("reconcile_paths: list_docs failed: {e}");
+                return Vec::new();
+            }
+        },
         Err(e) => {
             tracing::error!("reconcile_paths: storage lock poisoned: {e}");
             return Vec::new();
         }
     };
-
-    let all_docs = match store.list_docs() {
-        Ok(docs) => docs,
-        Err(e) => {
-            tracing::error!("reconcile_paths: list_docs failed: {e}");
-            return Vec::new();
-        }
-    };
+    // Lock is now dropped.
 
     // Build set of known local_paths for quick lookup
     let known_paths: HashSet<String> = all_docs
@@ -81,7 +81,7 @@ pub fn reconcile_paths(
     }
 
     // Find orphan files: .md files in docs/ (recursively) that are NOT in any doc's local_path
-    // Also skip conflict files
+    // Also skip conflict files and editor temp/lock files (.~ prefix)
     let orphan_files: Vec<PathBuf> = walkdir::WalkDir::new(&docs_path)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -91,8 +91,9 @@ pub fn reconcile_paths(
             let is_md = p.extension().and_then(|e| e.to_str()) == Some("md");
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let is_conflict = fname.contains(".conflict-");
+            let is_temp = fname.starts_with(".~");
             let is_known = known_paths.contains(&p.to_string_lossy().to_string());
-            is_md && !is_conflict && !is_known
+            is_md && !is_conflict && !is_temp && !is_known
         })
         .collect();
 
@@ -107,7 +108,7 @@ pub fn reconcile_paths(
     let mut matches = Vec::new();
     let mut used_files: HashSet<PathBuf> = HashSet::new();
 
-    // Pass 1: Match by content hash (most reliable)
+    // Pass 1: Match by content hash (most reliable) — file I/O without lock
     for doc in &orphan_docs {
         if let Some(ref doc_hash) = doc.content_hash {
             for file_path in &orphan_files {
@@ -118,18 +119,20 @@ pub fn reconcile_paths(
                     let file_hash = hash_content(&content);
                     if &file_hash == doc_hash {
                         let new_path = file_path.to_string_lossy().to_string();
-                        if let Err(e) = store.update_local_path(&doc.doc_id, &new_path) {
-                            tracing::error!(
-                                "reconcile_paths: update_local_path failed for {}: {e}",
-                                doc.doc_id
-                            );
-                            continue;
-                        }
-                        // Update title from new filename so UI reflects the rename
-                        let new_title = title_from_filename(file_path);
-                        if let Some(ref t) = new_title {
-                            if t != &doc.title {
-                                let _ = store.update_title(&doc.doc_id, t);
+                        // Brief lock for DB update
+                        if let Ok(store) = storage.lock() {
+                            if let Err(e) = store.update_local_path(&doc.doc_id, &new_path) {
+                                tracing::error!(
+                                    "reconcile_paths: update_local_path failed for {}: {e}",
+                                    doc.doc_id
+                                );
+                                continue;
+                            }
+                            let new_title = title_from_filename(file_path);
+                            if let Some(ref t) = new_title {
+                                if t != &doc.title {
+                                    let _ = store.update_title(&doc.doc_id, t);
+                                }
                             }
                         }
                         tracing::info!(
@@ -163,26 +166,26 @@ pub fn reconcile_paths(
             if used_files.contains(file_path) {
                 continue;
             }
-            // Compare the file's title (from content) with doc.title
             if let Ok(content) = std::fs::read_to_string(file_path) {
                 let file_title = extract_title(&content);
                 if file_title == doc.title {
                     let new_path = file_path.to_string_lossy().to_string();
-                    // Also update the content hash while we're at it
                     let new_hash = hash_content(content.as_bytes());
-                    if let Err(e) = store.update_local_path(&doc.doc_id, &new_path) {
-                        tracing::error!(
-                            "reconcile_paths: update_local_path failed for {}: {e}",
-                            doc.doc_id
-                        );
-                        continue;
-                    }
-                    let _ = store.update_content_hash(&doc.doc_id, &new_hash);
-                    // Update title from new filename so UI reflects the rename
-                    let new_title = title_from_filename(file_path);
-                    if let Some(ref t) = new_title {
-                        if t != &doc.title {
-                            let _ = store.update_title(&doc.doc_id, t);
+                    // Brief lock for DB update
+                    if let Ok(store) = storage.lock() {
+                        if let Err(e) = store.update_local_path(&doc.doc_id, &new_path) {
+                            tracing::error!(
+                                "reconcile_paths: update_local_path failed for {}: {e}",
+                                doc.doc_id
+                            );
+                            continue;
+                        }
+                        let _ = store.update_content_hash(&doc.doc_id, &new_hash);
+                        let new_title = title_from_filename(file_path);
+                        if let Some(ref t) = new_title {
+                            if t != &doc.title {
+                                let _ = store.update_title(&doc.doc_id, t);
+                            }
                         }
                     }
                     tracing::info!(
@@ -271,9 +274,10 @@ pub fn scan_folder_tree(
 }
 
 /// Rename local files whose filename doesn't match their content title.
-/// Reads each file, extracts the title from content, and if it differs from
-/// the current filename: updates DB title, renames file, updates DB path —
-/// all atomically so the UI and filesystem stay in sync.
+///
+/// **Only processes documents with `pending_rename = true`** — set by `quick_note()`
+/// and `create_doc()` to defer title-based rename until the editor closes.
+/// Normal documents are never renamed by this function.
 ///
 /// Called after editor process exits and at app startup.
 ///
@@ -282,25 +286,25 @@ pub fn rename_stale_paths(
     workspace: &Path,
     storage: &Arc<Mutex<Storage>>,
 ) -> usize {
-    let store = match storage.lock() {
-        Ok(s) => s,
+    // Only process docs marked for rename — not all docs.
+    let pending_docs = match storage.lock() {
+        Ok(store) => match store.list_pending_rename_docs() {
+            Ok(docs) => docs,
+            Err(e) => {
+                tracing::error!("rename_stale_paths: list_pending_rename_docs failed: {e}");
+                return 0;
+            }
+        },
         Err(e) => {
             tracing::error!("rename_stale_paths: storage lock poisoned: {e}");
             return 0;
         }
     };
-
-    let all_docs = match store.list_docs() {
-        Ok(docs) => docs,
-        Err(e) => {
-            tracing::error!("rename_stale_paths: list_docs failed: {e}");
-            return 0;
-        }
-    };
+    // Lock is now dropped — safe to do file I/O.
 
     let mut count = 0;
 
-    for doc in &all_docs {
+    for doc in &pending_docs {
         let Some(ref local_path_str) = doc.local_path else {
             continue;
         };
@@ -309,7 +313,7 @@ pub fn rename_stale_paths(
             continue; // Orphan — handled by reconcile_paths
         }
 
-        // Read the file and extract the actual title from content
+        // Read the file and extract the actual title from content (no lock held)
         let content = match std::fs::read_to_string(&old_path) {
             Ok(c) => c,
             Err(e) => {
@@ -320,22 +324,43 @@ pub fn rename_stale_paths(
         let content_title = extract_title(&content);
 
         // Check if filename already matches the content title
-        // Use the doc's folder so rename stays in the same subfolder
         let folder = &doc.folder_path;
         let expected_path = titled_content_path_in(workspace, folder, &content_title);
         if old_path == expected_path {
-            // Filename matches. Still update DB title if it's stale.
-            if doc.title != content_title {
-                let _ = store.update_title(&doc.doc_id, &content_title);
+            // Filename already matches title — clear the flag, update title if stale.
+            if let Ok(store) = storage.lock() {
+                let _ = store.set_pending_rename(&doc.doc_id, false);
+                if doc.title != content_title {
+                    let _ = store.update_title(&doc.doc_id, &content_title);
+                }
             }
             continue;
         }
 
-        // Compute a safe target path (avoids collisions), staying in the same folder
-        let new_path = unique_content_path_in(workspace, folder, &content_title);
+        // Re-acquire lock briefly for DB updates
+        let store = match storage.lock() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("rename_stale_paths: storage lock poisoned during update: {e}");
+                continue;
+            }
+        };
 
-        // Update DB atomically: title + path, then rename file
-        if let Err(e) = store.update_title(&doc.doc_id, &content_title) {
+        // Verify doc still has expected local_path (race protection)
+        if let Ok(Some(current)) = store.get_doc(&doc.doc_id) {
+            if current.local_path.as_deref() != Some(local_path_str) {
+                continue; // Another thread updated the path, skip
+            }
+        }
+
+        // Ensure unique title within folder (DB-level dedup)
+        let unique_title = store.unique_title(&content_title, folder, Some(&doc.doc_id))
+            .unwrap_or_else(|_| content_title.clone());
+
+        // Compute a safe target path (filesystem-level dedup)
+        let new_path = unique_content_path_in(workspace, folder, &unique_title);
+
+        if let Err(e) = store.update_title(&doc.doc_id, &unique_title) {
             tracing::error!(
                 "rename_stale_paths: update_title failed for {}: {e}",
                 doc.doc_id
@@ -348,13 +373,19 @@ pub fn rename_stale_paths(
                 "rename_stale_paths: update_local_path failed for {}: {e}",
                 doc.doc_id
             );
-            // Revert title
             let _ = store.update_title(&doc.doc_id, &doc.title);
             continue;
         }
 
+        // Drop lock before file rename
+        drop(store);
+
         match std::fs::rename(&old_path, &new_path) {
             Ok(()) => {
+                // Clear pending_rename flag after successful rename
+                if let Ok(store) = storage.lock() {
+                    let _ = store.set_pending_rename(&doc.doc_id, false);
+                }
                 tracing::info!(
                     "rename_stale_paths: {} → {} (doc={}, title='{}')",
                     old_path.display(),
@@ -371,13 +402,63 @@ pub fn rename_stale_paths(
                     new_path.display()
                 );
                 // Revert DB
-                let _ = store.update_local_path(&doc.doc_id, local_path_str);
-                let _ = store.update_title(&doc.doc_id, &doc.title);
+                if let Ok(store) = storage.lock() {
+                    let _ = store.update_local_path(&doc.doc_id, local_path_str);
+                    let _ = store.update_title(&doc.doc_id, &doc.title);
+                }
             }
         }
     }
 
     count
+}
+
+/// Find `.md` files in `docs/` that are not tracked by any document in the DB.
+/// Skips conflict files. Used at startup and by the watcher to discover
+/// externally-created files that should be adopted into the system.
+pub fn scan_orphan_files(
+    workspace: &Path,
+    storage: &Arc<Mutex<Storage>>,
+) -> Vec<PathBuf> {
+    let docs_path = docs_dir(workspace);
+    if !docs_path.exists() {
+        return Vec::new();
+    }
+
+    let store = match storage.lock() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("scan_orphan_files: storage lock poisoned: {e}");
+            return Vec::new();
+        }
+    };
+
+    let known_paths: HashSet<String> = match store.list_docs() {
+        Ok(docs) => docs
+            .iter()
+            .filter_map(|d| d.local_path.as_ref())
+            .cloned()
+            .collect(),
+        Err(e) => {
+            tracing::error!("scan_orphan_files: list_docs failed: {e}");
+            return Vec::new();
+        }
+    };
+
+    walkdir::WalkDir::new(&docs_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| {
+            let is_md = p.extension().and_then(|e| e.to_str()) == Some("md");
+            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let is_conflict = fname.contains(".conflict-");
+            let is_temp = fname.starts_with(".~");
+            let is_known = known_paths.contains(&p.to_string_lossy().to_string());
+            is_md && !is_conflict && !is_temp && !is_known
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -410,6 +491,8 @@ mod tests {
             content_hash: content_hash.map(|s| s.to_string()),
             sync_status: SyncStatus::Synced,
             folder_path: String::new(),
+        file_size: None,
+        word_count: None,
         };
         storage.lock().unwrap().upsert_doc(&meta).unwrap();
     }
@@ -636,6 +719,8 @@ mod tests {
             Some(&old_path.to_string_lossy()),
             Some(&hash_content(content.as_bytes())),
         );
+        // Mark for rename (as quick_note/create_doc would)
+        storage.lock().unwrap().set_pending_rename("doc1", true).unwrap();
 
         let count = rename_stale_paths(tmp.path(), &storage);
         assert_eq!(count, 1);
@@ -688,6 +773,8 @@ mod tests {
             Some(&stale.to_string_lossy()),
             None,
         );
+        // Mark for rename
+        storage.lock().unwrap().set_pending_rename("stale", true).unwrap();
 
         let count = rename_stale_paths(tmp.path(), &storage);
         assert_eq!(count, 1);

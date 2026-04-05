@@ -99,3 +99,6 @@ export const deleteFolder = (folderPath: string) =>
 
 export const moveDocToFolder = (docId: string, targetFolder: string) =>
   invoke<void>("move_doc_to_folder", { docId, targetFolder });
+
+export const renameDoc = (docId: string, newTitle: string) =>
+  invoke<DocMeta>("rename_doc", { docId, newTitle });

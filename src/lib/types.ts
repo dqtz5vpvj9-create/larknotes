@@ -10,6 +10,8 @@ export interface DocMeta {
   content_hash: string | null;
   sync_status: SyncStatus;
   folder_path: string;
+  file_size: number | null;
+  word_count: number | null;
 }
 
 export interface FolderTreeNode {
@@ -22,7 +24,10 @@ export interface FolderTreeNode {
 export type SyncStatus =
   | { type: "Synced" }
   | { type: "LocalModified" }
+  | { type: "RemoteModified" }
+  | { type: "BothModified" }
   | { type: "Syncing" }
+  | { type: "Pulling" }
   | { type: "Conflict" }
   | { type: "Error"; message: string }
   | { type: "New" };
@@ -46,6 +51,7 @@ export interface SyncStatusUpdate {
   doc_id: string;
   status: SyncStatus;
   title: string | null;
+  new_doc_id?: string;
 }
 
 export interface SyncHistoryEntry {
@@ -73,8 +79,14 @@ export function syncStatusLabel(status: SyncStatus): string {
       return "已同步";
     case "LocalModified":
       return "本地已修改";
+    case "RemoteModified":
+      return "远程已修改";
+    case "BothModified":
+      return "双方已修改";
     case "Syncing":
       return "同步中...";
+    case "Pulling":
+      return "拉取中...";
     case "Conflict":
       return "冲突";
     case "Error":
@@ -88,7 +100,10 @@ export function syncStatusColor(type: string): string {
   switch (type) {
     case "Synced": return "var(--c-green)";
     case "Syncing": return "var(--c-blue)";
+    case "Pulling": return "var(--c-blue)";
     case "LocalModified": return "var(--c-amber)";
+    case "RemoteModified": return "var(--c-blue)";
+    case "BothModified": return "var(--c-red)";
     case "Conflict": return "var(--c-red)";
     case "Error": return "var(--c-red)";
     default: return "var(--c-text-tertiary)";
@@ -98,9 +113,12 @@ export function syncStatusColor(type: string): string {
 /** Sort priority for sync status (lower = higher priority) */
 function syncStatusPriority(type: string): number {
   switch (type) {
+    case "BothModified": return 0;
     case "Conflict": return 0;
     case "Error": return 1;
     case "Syncing": return 2;
+    case "Pulling": return 2;
+    case "RemoteModified": return 3;
     case "LocalModified": return 3;
     case "New": return 4;
     case "Synced": return 5;
@@ -185,4 +203,19 @@ export function highlightSegments(text: string, query: string): { text: string; 
   }
   if (lastIndex < text.length) segments.push({ text: text.slice(lastIndex), match: false });
   return segments.length ? segments : [{ text, match: false }];
+}
+
+/** Format file size in human-readable form (B, KB, MB) */
+export function formatFileSize(bytes: number | null): string {
+  if (bytes == null) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Format word count with appropriate unit */
+export function formatWordCount(count: number | null): string {
+  if (count == null) return "";
+  if (count >= 10000) return `${(count / 10000).toFixed(1)} 万字`;
+  return `${count} 字`;
 }

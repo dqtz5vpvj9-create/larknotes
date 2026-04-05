@@ -39,6 +39,7 @@ impl EditorLauncher {
         #[cfg(windows)]
         {
             Command::new("explorer")
+                .arg("/select,")
                 .arg(path)
                 .spawn()
                 .map_err(|e| LarkNotesError::Editor(format!("打开文件管理器失败: {e}")))?;

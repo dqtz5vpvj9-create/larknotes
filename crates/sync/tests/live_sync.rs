@@ -59,6 +59,8 @@ async fn create_synced_doc(
         content_hash: hash,
         sync_status: SyncStatus::Synced,
         folder_path: String::new(),
+        file_size: None,
+        word_count: None,
     };
     storage.lock().unwrap().upsert_doc(&db_meta).unwrap();
 
@@ -314,6 +316,8 @@ async fn test_live_push_s5_recreate_fail() {
         content_hash: None,
         sync_status: SyncStatus::Synced,
         folder_path: String::new(),
+        file_size: None,
+        word_count: None,
     };
     storage.lock().unwrap().upsert_doc(&meta).unwrap();
 

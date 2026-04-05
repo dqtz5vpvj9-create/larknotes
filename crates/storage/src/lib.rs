@@ -87,6 +87,12 @@ impl Storage {
             (4, "
                 ALTER TABLE folders RENAME COLUMN remote_token TO remote_id;
             "),
+            (5, "
+                CREATE INDEX IF NOT EXISTS idx_local_path ON documents(local_path);
+            "),
+            (6, "
+                ALTER TABLE documents ADD COLUMN pending_rename INTEGER NOT NULL DEFAULT 0;
+            "),
         ];
 
         for (version, sql) in &migrations {
@@ -115,12 +121,25 @@ impl Storage {
 
     pub fn upsert_doc(&self, meta: &DocMeta) -> Result<(), LarkNotesError> {
         let sync_status_str = serde_json::to_string(&meta.sync_status).unwrap_or_default();
+        // Use ON CONFLICT ... DO UPDATE to preserve remote_hash (not in the insert list).
+        // INSERT OR REPLACE would delete the row first, silently clearing remote_hash.
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO documents
+                "INSERT INTO documents
                  (doc_id, title, doc_type, url, owner_name, created_at, updated_at,
                   local_path, content_hash, sync_status, folder_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(doc_id) DO UPDATE SET
+                  title = excluded.title,
+                  doc_type = excluded.doc_type,
+                  url = excluded.url,
+                  owner_name = excluded.owner_name,
+                  created_at = excluded.created_at,
+                  updated_at = excluded.updated_at,
+                  local_path = excluded.local_path,
+                  content_hash = excluded.content_hash,
+                  sync_status = excluded.sync_status,
+                  folder_path = excluded.folder_path",
                 params![
                     meta.doc_id,
                     meta.title,
@@ -169,6 +188,20 @@ impl Storage {
             .collect();
 
         Ok(docs)
+    }
+
+    /// Look up a document by its local file path. O(1) via idx_local_path index.
+    pub fn get_doc_by_path(&self, path: &str) -> Result<Option<DocMeta>, LarkNotesError> {
+        self.conn
+            .query_row(
+                "SELECT doc_id, title, doc_type, url, owner_name, created_at, updated_at,
+                        local_path, content_hash, sync_status, folder_path
+                 FROM documents WHERE local_path = ?1",
+                params![path],
+                |row| Ok(row_to_doc_meta(row)),
+            )
+            .optional()
+            .map_err(|e| LarkNotesError::Storage(format!("按路径查询文档失败: {e}")))
     }
 
     pub fn update_sync_status(
@@ -235,16 +268,23 @@ impl Storage {
             .map_err(|e| LarkNotesError::Storage(format!("查询配置失败: {e}")))
     }
 
-    /// Reset any docs stuck in "Syncing" state (from a crash) back to "LocalModified".
+    /// Reset any docs stuck in transient states (from a crash) back to "LocalModified".
+    /// Handles: Syncing, Pulling, BothModified.
     pub fn reset_stale_syncing(&self) -> Result<usize, LarkNotesError> {
-        let syncing_str = serde_json::to_string(&SyncStatus::Syncing).unwrap_or_default();
         let modified_str = serde_json::to_string(&SyncStatus::LocalModified).unwrap_or_default();
-        let count = self.conn
-            .execute(
-                "UPDATE documents SET sync_status = ?1 WHERE sync_status = ?2",
-                params![modified_str, syncing_str],
-            )
-            .map_err(|e| LarkNotesError::Storage(format!("重置同步状态失败: {e}")))?;
+        let stale_states = [
+            serde_json::to_string(&SyncStatus::Syncing).unwrap_or_default(),
+            serde_json::to_string(&SyncStatus::Pulling).unwrap_or_default(),
+        ];
+        let mut count = 0usize;
+        for stale_str in &stale_states {
+            count += self.conn
+                .execute(
+                    "UPDATE documents SET sync_status = ?1 WHERE sync_status = ?2",
+                    params![modified_str, stale_str],
+                )
+                .map_err(|e| LarkNotesError::Storage(format!("重置同步状态失败: {e}")))?;
+        }
         Ok(count)
     }
 
@@ -416,6 +456,143 @@ impl Storage {
             .collect();
 
         Ok(docs)
+    }
+
+    /// Mark a document as needing rename after editor closes.
+    /// Used by quick_note() and create_doc() to defer title-based rename.
+    pub fn set_pending_rename(&self, doc_id: &str, pending: bool) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "UPDATE documents SET pending_rename = ?1 WHERE doc_id = ?2",
+                params![pending as i32, doc_id],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("设置pending_rename失败: {e}")))?;
+        Ok(())
+    }
+
+    /// List documents that need rename after editor closes.
+    pub fn list_pending_rename_docs(&self) -> Result<Vec<DocMeta>, LarkNotesError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT doc_id, title, doc_type, url, owner_name, created_at, updated_at,
+                        local_path, content_hash, sync_status, folder_path
+                 FROM documents WHERE pending_rename = 1",
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?;
+
+        let docs = stmt
+            .query_map([], |row| Ok(row_to_doc_meta(row)))
+            .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(docs)
+    }
+
+    /// Find a document by content hash whose local_path is missing or doesn't exist.
+    /// Used by adopt_new_file to reclaim orphaned docs instead of creating duplicates.
+    pub fn find_orphan_by_hash(&self, hash: &str) -> Result<Option<DocMeta>, LarkNotesError> {
+        // Find docs with matching content_hash
+        let mut stmt = self.conn
+            .prepare(
+                "SELECT doc_id, title, doc_type, url, owner_name, created_at, updated_at,
+                        local_path, content_hash, sync_status, folder_path
+                 FROM documents WHERE content_hash = ?1",
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?;
+
+        let docs: Vec<DocMeta> = stmt
+            .query_map(params![hash], |row| Ok(row_to_doc_meta(row)))
+            .map_err(|e| LarkNotesError::Storage(format!("查询失败: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Return the first doc whose local_path is missing or file doesn't exist
+        for doc in docs {
+            match &doc.local_path {
+                None => return Ok(Some(doc)),
+                Some(p) if !std::path::Path::new(p).exists() => return Ok(Some(doc)),
+                _ => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Check if a title already exists in a folder (excluding a specific doc_id).
+    pub fn title_exists_in_folder(
+        &self,
+        title: &str,
+        folder: &str,
+        exclude_doc_id: Option<&str>,
+    ) -> Result<bool, LarkNotesError> {
+        let exists: bool = match exclude_doc_id {
+            Some(exclude) => self.conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM documents WHERE title = ?1 AND folder_path = ?2 AND doc_id != ?3)",
+                    params![title, folder, exclude],
+                    |row| row.get(0),
+                ),
+            None => self.conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM documents WHERE title = ?1 AND folder_path = ?2)",
+                    params![title, folder],
+                    |row| row.get(0),
+                ),
+        }
+        .map_err(|e| LarkNotesError::Storage(format!("查询标题唯一性失败: {e}")))?;
+        Ok(exists)
+    }
+
+    /// Generate a unique title within a folder by appending (2), (3) etc.
+    pub fn unique_title(
+        &self,
+        title: &str,
+        folder: &str,
+        exclude_doc_id: Option<&str>,
+    ) -> Result<String, LarkNotesError> {
+        if !self.title_exists_in_folder(title, folder, exclude_doc_id)? {
+            return Ok(title.to_string());
+        }
+        for n in 2..=999 {
+            let candidate = format!("{title} ({n})");
+            if !self.title_exists_in_folder(&candidate, folder, exclude_doc_id)? {
+                return Ok(candidate);
+            }
+        }
+        // Fallback with timestamp
+        Ok(format!(
+            "{title} ({})",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ))
+    }
+
+    /// Read the cached remote_hash for a document.
+    pub fn get_remote_hash(&self, doc_id: &str) -> Result<Option<String>, LarkNotesError> {
+        self.conn
+            .query_row(
+                "SELECT remote_hash FROM documents WHERE doc_id = ?1",
+                params![doc_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+            .map_err(|e| LarkNotesError::Storage(format!("查询远程哈希失败: {e}")))
+    }
+
+    /// After a successful sync (push or pull), set both content_hash (base)
+    /// and remote_hash to the same value — they are now in agreement.
+    pub fn set_synced_hashes(&self, doc_id: &str, hash: &str) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "UPDATE documents SET content_hash = ?1, remote_hash = ?1 WHERE doc_id = ?2",
+                params![hash, doc_id],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("更新同步哈希失败: {e}")))?;
+        Ok(())
     }
 
     /// Update remote content hash for a document
@@ -622,6 +799,8 @@ fn row_to_doc_meta(row: &rusqlite::Row) -> DocMeta {
         content_hash: row.get(8).unwrap_or_default(),
         sync_status,
         folder_path: row.get(10).unwrap_or_default(),
+        file_size: None,
+        word_count: None,
     }
 }
 
@@ -646,6 +825,8 @@ mod tests {
             content_hash: None,
             sync_status: SyncStatus::Synced,
             folder_path: String::new(),
+            file_size: None,
+            word_count: None,
         }
     }
 

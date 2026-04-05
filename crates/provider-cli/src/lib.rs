@@ -292,6 +292,8 @@ pub fn parse_search_results(json: &serde_json::Value) -> Vec<DocMeta> {
             content_hash: None,
             sync_status: SyncStatus::New,
             folder_path: String::new(),
+            file_size: None,
+            word_count: None,
         });
     }
 
@@ -327,6 +329,8 @@ pub fn parse_create_response(
         content_hash: None,
         sync_status: SyncStatus::Synced,
         folder_path: String::new(),
+        file_size: None,
+        word_count: None,
     })
 }
 
@@ -389,6 +393,8 @@ impl DocProvider for CliProvider {
             content_hash: None,
             sync_status: SyncStatus::Synced,
             folder_path: String::new(),
+            file_size: None,
+            word_count: None,
         };
         Ok(ReadOutput { content, meta })
     }

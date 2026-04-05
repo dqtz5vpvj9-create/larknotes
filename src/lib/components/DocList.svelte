@@ -1,6 +1,6 @@
 <script lang="ts">
   import { openDocInEditor } from "../api";
-  import { syncStatusLabel, syncStatusColor, highlightSegments, formatRelativeTime, formatShortDate, sortDocs } from "../types";
+  import { syncStatusLabel, syncStatusColor, highlightSegments, formatRelativeTime, formatShortDate, formatFileSize, formatWordCount, sortDocs } from "../types";
   import type { DocMeta, SortField, SortDirection } from "../types";
   import ContextMenu from "./ContextMenu.svelte";
 
@@ -12,6 +12,7 @@
     onPull?: (docId: string) => void;
     onImport?: (docId: string) => void;
     onDelete?: (docId: string) => void;
+    onRename?: (docId: string) => void;
     onReveal?: (docId: string) => void;
     onShowHistory?: (docId: string) => void;
     onResolveConflict?: (docId: string) => void;
@@ -21,7 +22,7 @@
 
   let {
     docs, searchQuery = "", onError, onSync, onPull, onImport,
-    onDelete, onReveal, onShowHistory, onResolveConflict,
+    onDelete, onRename, onReveal, onShowHistory, onResolveConflict,
     onBatchDelete, onBatchSync,
   }: Props = $props();
 
@@ -109,6 +110,10 @@
       });
     }
     items.push({
+      label: "重命名",
+      action: () => onRename?.(doc.doc_id),
+    });
+    items.push({
       label: "推送到远程",
       action: () => onSync(doc.doc_id),
       separator: true,
@@ -117,7 +122,13 @@
       label: "从远程拉取",
       action: () => onPull?.(doc.doc_id),
     });
-    if (doc.sync_status.type === "Conflict") {
+    if (doc.sync_status.type === "RemoteModified") {
+      items.push({
+        label: "拉取远程更新",
+        action: () => onPull?.(doc.doc_id),
+      });
+    }
+    if (doc.sync_status.type === "BothModified" || doc.sync_status.type === "Conflict") {
       items.push({
         label: "解决冲突",
         action: () => onResolveConflict?.(doc.doc_id),
@@ -138,7 +149,7 @@
   }
 
   function isWarning(type: string): boolean {
-    return type === "Conflict" || type === "Error";
+    return type === "Conflict" || type === "BothModified" || type === "Error";
   }
 
   function animDelay(i: number): number {
@@ -246,7 +257,7 @@
               {/if}
             </span>
             <span class="doc-meta">
-              {formatRelativeTime(doc.updated_at)}{#if doc.created_at} · {formatShortDate(doc.created_at)}{/if}
+              {#if doc.word_count != null}<span class="doc-stat">{formatWordCount(doc.word_count)}</span>{/if}{#if doc.file_size != null}<span class="doc-stat">{formatFileSize(doc.file_size)}</span>{/if}{formatRelativeTime(doc.updated_at)}{#if doc.created_at} · {formatShortDate(doc.created_at)}{/if}
             </span>
           </div>
 
@@ -528,6 +539,11 @@
     color: var(--c-text-tertiary);
     letter-spacing: 0.01em;
     white-space: nowrap;
+  }
+  .doc-stat {
+    margin-right: 6px;
+    padding-right: 6px;
+    border-right: 1px solid var(--c-border, rgba(0,0,0,0.08));
   }
   .doc-badge {
     flex-shrink: 0;

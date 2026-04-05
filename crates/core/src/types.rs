@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocMeta {
@@ -16,6 +17,12 @@ pub struct DocMeta {
     /// Relative folder path under docs/, e.g. "项目A/周报". Empty string = root.
     #[serde(default)]
     pub folder_path: String,
+    /// File size in bytes (computed, not stored in DB).
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    /// Word count (computed, not stored in DB). Uses UAX#29 segmentation.
+    #[serde(default)]
+    pub word_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +50,10 @@ pub struct WriteMeta {
 pub enum SyncStatus {
     Synced,
     LocalModified,
+    RemoteModified,
+    BothModified,
     Syncing,
+    Pulling,
     Conflict,
     Error(String),
     New,
@@ -221,6 +231,12 @@ pub fn extract_title(content: &str) -> String {
         .unwrap_or_else(|| "Untitled".to_string())
 }
 
+/// Count words in text using UAX#29 word segmentation.
+/// Handles CJK (each ideograph = 1 word), Latin, Cyrillic, Arabic, etc.
+pub fn count_words(text: &str) -> usize {
+    text.unicode_words().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,7 +316,10 @@ mod tests {
         let variants = vec![
             SyncStatus::Synced,
             SyncStatus::LocalModified,
+            SyncStatus::RemoteModified,
+            SyncStatus::BothModified,
             SyncStatus::Syncing,
+            SyncStatus::Pulling,
             SyncStatus::Conflict,
             SyncStatus::Error("test".into()),
             SyncStatus::New,
@@ -320,6 +339,35 @@ mod tests {
         assert_eq!(cfg.provider_cli_path, "lark-cli");
         assert_eq!(cfg.sync_debounce_ms, 2000);
         assert!(cfg.auto_sync);
+    }
+
+    #[test]
+    fn test_count_words_english() {
+        assert_eq!(count_words("Hello world"), 2);
+        assert_eq!(count_words("one two three four five"), 5);
+        assert_eq!(count_words(""), 0);
+        assert_eq!(count_words("   "), 0);
+    }
+
+    #[test]
+    fn test_count_words_chinese() {
+        // Each CJK ideograph counts as one word per UAX#29
+        assert_eq!(count_words("你好世界"), 4);
+        assert_eq!(count_words("测试文档内容"), 6);
+    }
+
+    #[test]
+    fn test_count_words_mixed() {
+        // Mixed CJK + Latin
+        let count = count_words("Hello 你好 world 世界");
+        assert_eq!(count, 6); // Hello, 你, 好, world, 世, 界
+    }
+
+    #[test]
+    fn test_count_words_markdown() {
+        let md = "# Title\n\nSome **bold** text and `code`.";
+        // Words: Title, Some, bold, text, and, code = 6
+        assert!(count_words(md) >= 6);
     }
 
     #[test]

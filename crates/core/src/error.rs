@@ -38,6 +38,7 @@ impl LarkNotesError {
         if msg.contains("401") || msg.contains("403") || msg.contains("404")
             || msg.contains("unauthorized") || msg.contains("forbidden")
             || msg.contains("not found") || msg.contains("permission")
+            || msg.contains("deleted") || msg.contains("已删除")
         {
             return false;
         }

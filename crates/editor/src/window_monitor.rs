@@ -188,6 +188,9 @@ impl<C: FileOpenChecker> WindowMonitor<C> {
                 Ok(m) => m,
                 Err(_) => return,
             };
+            if map.is_empty() {
+                return;
+            }
             map.iter()
                 .filter(|(_, tf)| {
                     tf.tracked_at.elapsed() >= self.grace_period

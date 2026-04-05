@@ -11,9 +11,10 @@ use tauri::tray::TrayIconBuilder;
 use larknotes_editor::{detect_editor, EditorLauncher};
 use larknotes_provider_cli::CliProvider;
 use larknotes_storage::Storage;
-use larknotes_sync::{FileWatcher, SyncEngine, SyncEvent};
+use larknotes_sync::{FileWatcher, SyncEngine, SyncEvent, scan_orphan_files};
 use state::AppState;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 fn main() {
@@ -151,7 +152,13 @@ fn main() {
             let debounce_ms = Arc::new(AtomicU64::new(config.sync_debounce_ms));
             let config = Arc::new(RwLock::new(config));
 
-            // 5. Init provider
+            // 5. Init provider (validate CLI exists)
+            if which::which(&cli_path).is_err() {
+                tracing::warn!(
+                    "Provider CLI '{}' not found in PATH. Sync will not work until installed.",
+                    cli_path
+                );
+            }
             let cli_provider = Arc::new(CliProvider::new(&cli_path));
             let provider: Arc<dyn DocProvider> = cli_provider.clone();
             let auth: Arc<dyn ProviderAuth> = cli_provider.clone();
@@ -170,9 +177,10 @@ fn main() {
             let sync_engine = Arc::new(sync_engine);
 
             // 8. Start file watcher — stored in app managed state to prevent drop
+            //    Watcher does NOT hold storage — sends events to engine for serial processing.
             let (docs_changed_tx, mut docs_changed_rx) = tokio::sync::mpsc::unbounded_channel();
-            let watcher = FileWatcher::with_notify(
-                workspace, sync_tx.clone(), storage.clone(), Some(docs_changed_tx),
+            let watcher = FileWatcher::new(
+                workspace.clone(), sync_tx.clone(),
             ).expect("Failed to start file watcher");
             app.manage(watcher);
 
@@ -202,8 +210,27 @@ fn main() {
                     }
                 });
 
-                SyncEngine::run(engine, sync_rx).await;
+                SyncEngine::run(engine, sync_rx, Some(docs_changed_tx)).await;
             });
+
+            // 9b. Adopt orphan .md files created while app was closed.
+            // Delegate to the engine's adopt_new_file via NewFileDetected events
+            // (avoids duplicating creation logic and the LocalModified→SyncRequested double-push bug).
+            {
+                let orphan_storage = storage.clone();
+                let orphan_workspace = workspace.clone();
+                let orphan_tx = sync_tx.clone();
+                tauri::async_runtime::spawn(async move {
+                    let orphans = scan_orphan_files(&orphan_workspace, &orphan_storage);
+                    if orphans.is_empty() {
+                        return;
+                    }
+                    tracing::info!("startup: found {} orphan file(s), sending to engine...", orphans.len());
+                    for path in orphans {
+                        let _ = orphan_tx.send(SyncEvent::NewFileDetected { path });
+                    }
+                });
+            }
 
             // 10. System tray
             let show_item = MenuItemBuilder::with_id("show", "显示窗口").build(app)?;
@@ -214,18 +241,25 @@ fn main() {
                 .item(&quit_item)
                 .build()?;
 
+            let quitting = Arc::new(AtomicBool::new(false));
+            let quitting_flag = quitting.clone();
+            app.manage(QuittingFlag(quitting));
+
             let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().cloned().unwrap())
                 .tooltip("LarkNotes")
                 .menu(&tray_menu)
                 .on_menu_event(move |app, event| {
                     match event.id().as_ref() {
                         "show" => {
                             if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.unminimize();
                                 let _ = w.show();
                                 let _ = w.set_focus();
                             }
                         }
                         "quit" => {
+                            quitting_flag.store(true, Ordering::SeqCst);
                             app.exit(0);
                         }
                         _ => {}
@@ -234,6 +268,7 @@ fn main() {
                 .on_tray_icon_event(|tray, event| {
                     if let tauri::tray::TrayIconEvent::DoubleClick { .. } = event {
                         if let Some(w) = tray.app_handle().get_webview_window("main") {
+                            let _ = w.unminimize();
                             let _ = w.show();
                             let _ = w.set_focus();
                         }
@@ -312,6 +347,7 @@ fn main() {
             manual_sync,
             import_doc,
             delete_doc,
+            rename_doc,
             reveal_in_explorer,
             get_sync_history,
             get_snapshots,
@@ -337,10 +373,15 @@ fn main() {
         .run(|app, event| {
             match event {
                 tauri::RunEvent::ExitRequested { api, .. } => {
-                    // Prevent exit — minimize to tray instead
-                    api.prevent_exit();
-                    if let Some(w) = app.get_webview_window("main") {
-                        let _ = w.hide();
+                    let is_quitting = app
+                        .try_state::<QuittingFlag>()
+                        .map_or(false, |f| f.0.load(Ordering::SeqCst));
+                    if !is_quitting {
+                        // Prevent exit — minimize to tray instead
+                        api.prevent_exit();
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.hide();
+                        }
                     }
                 }
                 tauri::RunEvent::Exit => {
@@ -361,3 +402,6 @@ fn main() {
 
 /// Wrapper to hold the sync shutdown sender in Tauri managed state.
 struct ShutdownSender(Mutex<Option<tokio::sync::mpsc::UnboundedSender<SyncEvent>>>);
+
+/// Flag to distinguish real quit from window-close-to-tray.
+struct QuittingFlag(Arc<AtomicBool>);

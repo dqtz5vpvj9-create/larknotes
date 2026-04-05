@@ -1,4 +1,4 @@
-use crate::{hash_content, SyncEvent};
+use crate::{hash_content, decide, reconcile_paths, SyncDecision, SyncEvent};
 use larknotes_core::*;
 use larknotes_storage::Storage;
 use serde::Serialize;
@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Semaphore};
 use tokio::time::{Duration, Instant};
 
 /// Decode file content from any encoding.
@@ -46,7 +46,13 @@ pub struct SyncStatusUpdate {
     pub doc_id: String,
     pub status: SyncStatus,
     pub title: Option<String>,
+    /// When set, the frontend should replace doc_id with this new ID (remote recreation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_doc_id: Option<String>,
 }
+
+/// Maximum number of concurrent sync tasks (matches Seafile's MAX_RUNNING_SYNC_TASKS).
+const MAX_CONCURRENT_SYNCS: usize = 5;
 
 pub struct SyncEngine {
     provider: Arc<dyn DocProvider>,
@@ -54,6 +60,7 @@ pub struct SyncEngine {
     workspace_dir: PathBuf,
     debounce_ms: Arc<AtomicU64>,
     status_tx: broadcast::Sender<SyncStatusUpdate>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl SyncEngine {
@@ -71,6 +78,7 @@ impl SyncEngine {
                 workspace_dir,
                 debounce_ms,
                 status_tx,
+                semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SYNCS)),
             },
             status_rx,
         )
@@ -83,9 +91,13 @@ impl SyncEngine {
     pub async fn run(
         engine: Arc<SyncEngine>,
         mut rx: mpsc::UnboundedReceiver<SyncEvent>,
+        docs_changed_tx: Option<mpsc::UnboundedSender<()>>,
     ) {
         let mut debounce_timers: HashMap<String, Instant> = HashMap::new();
         let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let mut poll_interval = tokio::time::interval(Duration::from_secs(300)); // 5 min
+        // Skip the first immediate tick of poll_interval
+        poll_interval.tick().await;
 
         tracing::info!("同步引擎已启动");
 
@@ -93,15 +105,220 @@ impl SyncEngine {
             tokio::select! {
                 Some(event) = rx.recv() => {
                     match event {
+                        // ── Watcher events (serialized here, no DB access in watcher) ──
+
+                        SyncEvent::FileModified { path } => {
+                            // Watcher detected .md file change — look up DB to determine action
+                            let path_str = path.to_string_lossy().to_string();
+                            let matched_doc = engine.storage.lock()
+                                .ok()
+                                .and_then(|s| s.get_doc_by_path(&path_str).ok().flatten());
+
+                            if let Some(doc) = matched_doc {
+                                // Known doc — update folder_path if needed, then debounce
+                                let folder = folder_of(&engine.workspace_dir, &path);
+                                if folder != doc.folder_path {
+                                    if let Ok(s) = engine.storage.lock() {
+                                        let _ = s.update_folder_path(&doc.doc_id, &folder);
+                                    }
+                                }
+                                let deadline = Instant::now()
+                                    + Duration::from_millis(engine.debounce_ms.load(Ordering::Relaxed));
+                                debounce_timers.insert(doc.doc_id.clone(), deadline);
+                                tracing::debug!("文件变更, 等待debounce: {}", doc.doc_id);
+                            } else {
+                                // Unknown file — adopt as new
+                                let engine = engine.clone();
+                                let sem = engine.semaphore.clone();
+                                tokio::spawn(async move {
+                                    let _permit = sem.acquire().await.unwrap();
+                                    engine.adopt_new_file(&path).await;
+                                });
+                            }
+                        }
                         SyncEvent::FileChanged { doc_id, .. } => {
                             let deadline = Instant::now()
                                 + Duration::from_millis(engine.debounce_ms.load(Ordering::Relaxed));
                             debounce_timers.insert(doc_id.clone(), deadline);
                             tracing::debug!("文件变更, 等待debounce: {doc_id}");
                         }
+                        SyncEvent::NewFileDetected { path } => {
+                            let engine = engine.clone();
+                            let sem = engine.semaphore.clone();
+                            tokio::spawn(async move {
+                                let _permit = sem.acquire().await.unwrap();
+                                engine.adopt_new_file(&path).await;
+                            });
+                        }
+                        SyncEvent::FileMoved { old_path, new_path } => {
+                            // Paired rename: update DB local_path + propagate rename to remote.
+                            let old_str = old_path.to_string_lossy().to_string();
+                            let new_str = new_path.to_string_lossy().to_string();
+                            let doc_to_rename = engine.storage.lock()
+                                .ok()
+                                .and_then(|store| {
+                                    if let Ok(Some(doc)) = store.get_doc_by_path(&old_str) {
+                                        let _ = store.update_local_path(&doc.doc_id, &new_str);
+                                        let folder = folder_of(&engine.workspace_dir, &new_path);
+                                        if folder != doc.folder_path {
+                                            let _ = store.update_folder_path(&doc.doc_id, &folder);
+                                        }
+                                        // Extract new title from the new filename
+                                        let new_title = new_path.file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("Untitled")
+                                            .to_string();
+                                        if new_title != doc.title {
+                                            let _ = store.update_title(&doc.doc_id, &new_title);
+                                        }
+                                        Some((doc.doc_id.clone(), doc.title.clone(), new_title))
+                                    } else {
+                                        None
+                                    }
+                                });
+
+                            if let Some((doc_id, old_title, new_title)) = doc_to_rename {
+                                tracing::info!("文件移动: {} → {} (doc={doc_id})", old_path.display(), new_path.display());
+                                if new_title != old_title {
+                                    // Propagate rename to remote (spawn to avoid blocking)
+                                    let provider = engine.provider.clone();
+                                    let did = doc_id.clone();
+                                    let nt = new_title.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = provider.rename(&did, &nt).await {
+                                            tracing::warn!("远端重命名失败: {did}: {e}");
+                                        } else {
+                                            tracing::info!("远端重命名成功: {did} → '{nt}'");
+                                        }
+                                    });
+                                }
+                            } else {
+                                // Old path not in DB — treat as new file
+                                let new_path_str = new_str.clone();
+                                let not_known = engine.storage.lock()
+                                    .ok()
+                                    .and_then(|s| s.get_doc_by_path(&new_path_str).ok().flatten())
+                                    .is_none();
+                                if not_known {
+                                    let engine = engine.clone();
+                                    let sem = engine.semaphore.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = sem.acquire().await.unwrap();
+                                        engine.adopt_new_file(&new_path).await;
+                                    });
+                                }
+                            }
+                            if let Some(ref tx) = docs_changed_tx {
+                                let _ = tx.send(());
+                            }
+                        }
+                        SyncEvent::FileDeleted { path } => {
+                            let path_str = path.to_string_lossy().to_string();
+                            let doc_to_delete = engine.storage.lock()
+                                .ok()
+                                .and_then(|store| store.get_doc_by_path(&path_str).ok().flatten());
+
+                            if let Some(doc) = doc_to_delete {
+                                tracing::info!("文件删除: {} (doc={})", path.display(), doc.doc_id);
+                                // Delete from remote (spawn to avoid blocking)
+                                let provider = engine.provider.clone();
+                                let storage = engine.storage.clone();
+                                let doc_id = doc.doc_id.clone();
+                                let workspace = engine.workspace_dir.clone();
+                                tokio::spawn(async move {
+                                    match provider.delete(&doc_id).await {
+                                        Ok(()) => tracing::info!("远端删除成功: {doc_id}"),
+                                        Err(e) => {
+                                            if e.is_not_found() {
+                                                tracing::debug!("远端已删除: {doc_id}");
+                                            } else {
+                                                tracing::warn!("远端删除失败: {doc_id}: {e}");
+                                            }
+                                        }
+                                    }
+                                    // Clean up DB + meta file
+                                    if let Ok(store) = storage.lock() {
+                                        let _ = store.delete_doc(&doc_id);
+                                    }
+                                    let _ = std::fs::remove_file(larknotes_core::meta_path(&workspace, &doc_id));
+                                });
+                            } else {
+                                tracing::debug!("文件删除: 未注册的文件, 忽略: {}", path.display());
+                            }
+                            if let Some(ref tx) = docs_changed_tx {
+                                let _ = tx.send(());
+                            }
+                        }
+                        SyncEvent::FileRenamed { workspace } => {
+                            // reconcile_paths() does file I/O (walkdir + hash) — spawn to
+                            // avoid blocking the event loop. DB updates happen in the spawned
+                            // task (safe: watcher no longer competes for storage).
+                            let storage = engine.storage.clone();
+                            let docs_changed = docs_changed_tx.clone();
+                            tokio::spawn(async move {
+                                let matches = reconcile_paths(&workspace, &storage);
+                                for m in &matches {
+                                    let new_path = PathBuf::from(&m.new_path);
+                                    let folder = folder_of(&workspace, &new_path);
+                                    if let Ok(s) = storage.lock() {
+                                        let _ = s.update_folder_path(&m.doc_id, &folder);
+                                    }
+                                }
+                                if !matches.is_empty() {
+                                    if let Some(ref tx) = docs_changed {
+                                        let _ = tx.send(());
+                                    }
+                                }
+                            });
+                        }
+                        SyncEvent::FolderRenamed { old_rel, new_rel } => {
+                            if let Ok(store) = engine.storage.lock() {
+                                let _ = store.rename_folder(&old_rel, &new_rel);
+                                let docs = docs_dir(&engine.workspace_dir);
+                                let old_dir = docs.join(&old_rel);
+                                let new_dir = docs.join(&new_rel);
+                                if let Ok(all_docs) = store.list_docs() {
+                                    for doc in &all_docs {
+                                        if let Some(ref lp) = doc.local_path {
+                                            let lp_path = std::path::Path::new(lp);
+                                            if lp_path.starts_with(&old_dir) {
+                                                if let Ok(suffix) = lp_path.strip_prefix(&old_dir) {
+                                                    let new_lp = new_dir.join(suffix).to_string_lossy().to_string();
+                                                    let _ = store.update_local_path(&doc.doc_id, &new_lp);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(ref tx) = docs_changed_tx {
+                                let _ = tx.send(());
+                            }
+                        }
+                        SyncEvent::FolderCreated { folder_path } => {
+                            if let Ok(s) = engine.storage.lock() {
+                                let _ = s.upsert_folder(&folder_path, None);
+                            }
+                            if let Some(ref tx) = docs_changed_tx {
+                                let _ = tx.send(());
+                            }
+                        }
+                        SyncEvent::FolderRemoved { folder_path } => {
+                            if let Ok(s) = engine.storage.lock() {
+                                let _ = s.delete_folder(&folder_path);
+                            }
+                            if let Some(ref tx) = docs_changed_tx {
+                                let _ = tx.send(());
+                            }
+                        }
+
+                        // ── User actions ──
+
                         SyncEvent::SyncRequested { doc_id } => {
                             let engine = engine.clone();
+                            let sem = engine.semaphore.clone();
                             tokio::spawn(async move {
+                                let _permit = sem.acquire().await.unwrap();
                                 engine.sync_one(&doc_id, true).await;
                             });
                         }
@@ -122,46 +339,56 @@ impl SyncEngine {
                     for doc_id in ready {
                         debounce_timers.remove(&doc_id);
                         let engine = engine.clone();
+                        let sem = engine.semaphore.clone();
                         tokio::spawn(async move {
+                            let _permit = sem.acquire().await.unwrap();
                             engine.sync_one(&doc_id, false).await;
                         });
                     }
+                }
+                _ = poll_interval.tick() => {
+                    let engine = engine.clone();
+                    tokio::spawn(async move {
+                        engine.poll_remote_changes().await;
+                    });
                 }
             }
         }
     }
 
-    /// Sync a single document. When `force` is true (manual sync),
-    /// always push even if content hash matches — this handles remote deletion.
+    /// Sync a single document using dual-hash-space comparison.
+    ///
+    /// Local and remote changes are detected independently:
+    /// - local_changed:  hash(file) ≠ content_hash  (both local format)
+    /// - remote_changed: hash(read()) ≠ remote_hash (both remote format)
+    ///
+    /// The two hash spaces are never compared across the format boundary.
     pub async fn sync_one(&self, doc_id: &str, force: bool) {
-        // Get local_path from storage
-        let local_path = match self.storage.lock() {
-            Ok(store) => store
-                .get_doc(doc_id)
-                .ok()
-                .flatten()
-                .and_then(|d| d.local_path)
-                .map(std::path::PathBuf::from),
+        // ── 1. Read DB state + local file ───────────────────────
+        let (content_path, content_hash, remote_hash_cached, old_title) = match self.storage.lock() {
+            Ok(store) => {
+                let doc = store.get_doc(doc_id).ok().flatten();
+                let local_path = doc.as_ref()
+                    .and_then(|d| d.local_path.as_ref())
+                    .map(std::path::PathBuf::from);
+                let base = doc.as_ref().and_then(|d| d.content_hash.clone());
+                let remote = store.get_remote_hash(doc_id).ok().flatten();
+                let title = doc.as_ref().map(|d| d.title.clone());
+                let path = match local_path {
+                    Some(p) if p.exists() => p,
+                    _ => {
+                        let t = title.clone().unwrap_or_default();
+                        titled_content_path(&self.workspace_dir, &t)
+                    }
+                };
+                (path, base, remote, title)
+            }
             Err(e) => {
                 tracing::error!("Storage lock poisoned: {e}");
                 return;
             }
         };
 
-        let content_path = match local_path {
-            Some(p) if p.exists() => p,
-            _ => {
-                // Fallback: try titled path from DB title
-                let title = self.storage.lock()
-                    .ok()
-                    .and_then(|s| s.get_doc(doc_id).ok().flatten())
-                    .map(|d| d.title)
-                    .unwrap_or_default();
-                titled_content_path(&self.workspace_dir, &title)
-            }
-        };
-
-        // 1. Read local content — handle UTF-8, UTF-8 BOM, and UTF-16 LE/BE
         let raw = match tokio::fs::read(&content_path).await {
             Ok(b) => b,
             Err(e) => {
@@ -170,56 +397,106 @@ impl SyncEngine {
             }
         };
         let content = decode_content(&raw);
+        let local_hash = hash_content(content.as_bytes());
 
-        // 2. Compute hash
-        let new_hash = hash_content(content.as_bytes());
+        // ── 2. Dual-space change detection ──────────────────────
+        let has_base = content_hash.is_some();
+        let local_changed = content_hash.as_deref() != Some(&local_hash);
 
-        // 3. Check if content actually changed
-        let old_hash = self.storage.lock()
-            .ok()
-            .and_then(|s| s.get_doc(doc_id).ok().flatten())
-            .and_then(|d| d.content_hash);
+        // Remote check: only when local changed or force (need to confirm remote state).
+        // When local is clean and not forced, skip network — let poll detect remote changes.
+        let (remote_changed, remote_content) = if !local_changed && !force {
+            (false, None)
+        } else {
+            match self.provider.read(doc_id).await {
+                Ok(read_output) => {
+                    let fresh_remote_hash = hash_content(read_output.content.as_bytes());
+                    // Cache fresh remote hash (in remote format space)
+                    if let Ok(store) = self.storage.lock() {
+                        let _ = store.update_remote_hash(doc_id, &fresh_remote_hash);
+                    }
+                    // Compare within remote hash space
+                    let changed = remote_hash_cached.as_deref()
+                        .map_or(false, |cached| fresh_remote_hash != cached);
+                    (changed, Some(read_output.content))
+                }
+                Err(e) => {
+                    if e.is_not_found() {
+                        tracing::warn!("远端文档已删除: {doc_id}: {e}");
+                        let title = extract_title(&content);
+                        self.emit_status(doc_id, SyncStatus::Syncing, None);
+                        self.recreate_on_remote(doc_id, &title, &content, &local_hash).await;
+                        return;
+                    }
+                    // Network failure — conservative: assume remote unchanged
+                    tracing::warn!("读取远端失败, 假设远端未变: {doc_id}: {e}");
+                    (false, None)
+                }
+            }
+        };
 
-        if old_hash.as_deref() == Some(&new_hash) && !force {
-            tracing::debug!("内容未变化, 跳过同步: {doc_id}");
-            return;
+        let decision = if force && !remote_changed {
+            SyncDecision::PushLocal
+        } else {
+            decide(local_changed, remote_changed, has_base)
+        };
+        tracing::debug!("sync决策: {doc_id} → {decision:?} (local_changed={local_changed}, remote_changed={remote_changed})");
+
+        // ── 3. Execute decision ─────────────────────────────────
+        match decision {
+            SyncDecision::NoChange => {
+                tracing::debug!("无变更, 跳过同步: {doc_id}");
+            }
+            SyncDecision::PullRemote => {
+                if let Some(remote_content) = remote_content {
+                    self.pull_to_local(doc_id, &remote_content).await;
+                } else {
+                    tracing::warn!("PullRemote但无远端内容: {doc_id}");
+                }
+            }
+            SyncDecision::BothModified => {
+                tracing::warn!("双端冲突检测: {doc_id}");
+                self.handle_conflict(doc_id).await;
+                if let Ok(store) = self.storage.lock() {
+                    let _ = store.update_sync_status(doc_id, &SyncStatus::BothModified);
+                }
+                self.emit_status(doc_id, SyncStatus::BothModified, None);
+            }
+            SyncDecision::NewFile => {
+                let title = extract_title(&content);
+                self.emit_status(doc_id, SyncStatus::Syncing, None);
+                self.push_to_remote(doc_id, &content, &local_hash, &title, old_title.as_deref()).await;
+            }
+            SyncDecision::PushLocal => {
+                let title = extract_title(&content);
+                self.emit_status(doc_id, SyncStatus::Syncing, None);
+                if let Ok(store) = self.storage.lock() {
+                    let _ = store.update_sync_status(doc_id, &SyncStatus::Syncing);
+                }
+                self.push_to_remote(doc_id, &content, &local_hash, &title, old_title.as_deref()).await;
+            }
         }
-        if force {
-            tracing::info!("手动同步, 强制推送: {doc_id}");
-        }
+    }
 
-        // 4. Update status to Syncing
-        self.emit_status(doc_id, SyncStatus::Syncing, None);
-        if let Ok(store) = self.storage.lock() {
-            let _ = store.update_sync_status(doc_id, &SyncStatus::Syncing);
-        }
+    /// Push local content to remote with retry logic.
+    async fn push_to_remote(&self, doc_id: &str, content: &str, local_hash: &str, title: &str, old_title: Option<&str>) {
+        let title_changed = old_title.map_or(false, |old| old != title);
 
-        // 5. Extract title
-        let title = extract_title(&content);
-
-        // 5b. Check if title changed (compared to DB) for conditional rename
-        let old_title = self.storage.lock()
-            .ok()
-            .and_then(|s| s.get_doc(doc_id).ok().flatten())
-            .map(|d| d.title);
-        let title_changed = old_title.as_deref() != Some(&title);
-
-        // 6. Push to remote with retry (exponential backoff: 5s, 15s, 45s)
         let retry_delays = [
             Duration::from_secs(5),
             Duration::from_secs(15),
             Duration::from_secs(45),
         ];
+
         // First attempt
-        match self.provider.write(doc_id, &content).await {
+        match self.provider.write(doc_id, content).await {
             Ok(write_meta) => {
                 tracing::debug!("write 成功: {doc_id}, remote_at={}", write_meta.updated_at);
                 if title_changed {
-                    if let Err(e) = self.provider.rename(doc_id, &title).await {
+                    if let Err(e) = self.provider.rename(doc_id, title).await {
                         tracing::error!("重命名失败 (内容已推送): {doc_id}: {e}");
-                        // Content is on remote but title is wrong — mark partial failure
                         if let Ok(store) = self.storage.lock() {
-                            let _ = store.update_content_hash(doc_id, &new_hash);
+                            let _ = store.set_synced_hashes(doc_id, local_hash);
                             let _ = store.update_sync_status(
                                 doc_id,
                                 &SyncStatus::Error(format!("标题同步失败: {e}")),
@@ -229,13 +506,13 @@ impl SyncEngine {
                         return;
                     }
                 }
-                self.mark_synced(doc_id, &new_hash, &content);
+                self.mark_synced(doc_id, local_hash, content);
                 return;
             }
             Err(e) => {
                 if e.is_not_found() {
                     tracing::warn!("远端文档已删除，重新创建: {doc_id}: {e}");
-                    self.recreate_on_remote(doc_id, &title, &content, &new_hash).await;
+                    self.recreate_on_remote(doc_id, title, content, local_hash).await;
                     return;
                 }
                 if !e.is_transient() {
@@ -264,14 +541,14 @@ impl SyncEngine {
 
             tokio::time::sleep(*delay).await;
 
-            match self.provider.write(doc_id, &content).await {
+            match self.provider.write(doc_id, content).await {
                 Ok(write_meta) => {
                     tracing::debug!("重试 write 成功: {doc_id}, remote_at={}", write_meta.updated_at);
                     if title_changed {
-                        if let Err(e) = self.provider.rename(doc_id, &title).await {
+                        if let Err(e) = self.provider.rename(doc_id, title).await {
                             tracing::error!("重试后重命名失败: {doc_id}: {e}");
                             if let Ok(store) = self.storage.lock() {
-                                let _ = store.update_content_hash(doc_id, &new_hash);
+                                let _ = store.set_synced_hashes(doc_id, local_hash);
                                 let _ = store.update_sync_status(
                                     doc_id,
                                     &SyncStatus::Error(format!("标题同步失败: {e}")),
@@ -282,10 +559,19 @@ impl SyncEngine {
                         }
                     }
                     tracing::info!("重试成功: {doc_id} (第{}次)", i + 1);
-                    self.mark_synced(doc_id, &new_hash, &content);
+                    self.mark_synced(doc_id, local_hash, content);
                     return;
                 }
                 Err(e) => {
+                    if e.is_not_found() {
+                        tracing::warn!("重试中发现远端已删除，重新创建: {doc_id}: {e}");
+                        self.recreate_on_remote(doc_id, title, content, local_hash).await;
+                        return;
+                    }
+                    if !e.is_transient() {
+                        tracing::error!("重试中遇到永久错误: {doc_id}: {e}");
+                        break;
+                    }
                     tracing::warn!("重试失败 ({}/3): {doc_id}: {e}", i + 1);
                 }
             }
@@ -301,18 +587,176 @@ impl SyncEngine {
     }
 
     fn mark_synced(&self, doc_id: &str, new_hash: &str, content: &str) {
-        if let Ok(store) = self.storage.lock() {
-            let _ = store.update_content_hash(doc_id, new_hash);
-            let _ = store.update_sync_status(doc_id, &SyncStatus::Synced);
-            // NOTE: We do NOT update title here. Title + filename are updated
-            // atomically by rename_stale_paths() after the editor closes.
-            // Updating title here would cause the UI to show a new name while
-            // the file still has the old name, creating a race condition.
-            let _ = store.add_sync_history(doc_id, "push", Some(new_hash));
-            let _ = store.save_snapshot(doc_id, content, new_hash);
+        match self.storage.lock() {
+            Ok(store) => {
+                // Only update content_hash (local format space).
+                // Do NOT touch remote_hash — it lives in the remote format space
+                // and will be updated by the next poll_remote_changes().
+                let _ = store.update_content_hash(doc_id, new_hash);
+                let _ = store.update_sync_status(doc_id, &SyncStatus::Synced);
+                // NOTE: We do NOT update title here. Title + filename are updated
+                // atomically by rename_stale_paths() after the editor closes.
+                let _ = store.add_sync_history(doc_id, "push", Some(new_hash));
+                let _ = store.save_snapshot(doc_id, content, new_hash);
+            }
+            Err(e) => tracing::error!("mark_synced: storage lock poisoned: {e}"),
         }
         self.emit_status(doc_id, SyncStatus::Synced, None);
         tracing::info!("同步成功: {doc_id}");
+    }
+
+    /// Auto-pull remote content to local file. Called when only remote changed.
+    async fn pull_to_local(&self, doc_id: &str, remote_content: &str) {
+        self.emit_status(doc_id, SyncStatus::Pulling, None);
+        if let Ok(store) = self.storage.lock() {
+            let _ = store.update_sync_status(doc_id, &SyncStatus::Pulling);
+        }
+
+        let local_path = self.storage.lock()
+            .ok()
+            .and_then(|s| s.get_doc(doc_id).ok().flatten())
+            .and_then(|d| d.local_path)
+            .map(std::path::PathBuf::from);
+
+        let write_path = match local_path {
+            Some(p) => p,
+            None => {
+                tracing::warn!("pull_to_local: 无本地路径: {doc_id}");
+                return;
+            }
+        };
+
+        // Write remote content to local file
+        if let Err(e) = tokio::fs::write(&write_path, remote_content).await {
+            tracing::error!("pull_to_local: 写入文件失败: {e}");
+            if let Ok(store) = self.storage.lock() {
+                let _ = store.update_sync_status(doc_id, &SyncStatus::Error(format!("写入失败: {e}")));
+            }
+            self.emit_status(doc_id, SyncStatus::Error(format!("写入失败: {e}")), None);
+            return;
+        }
+
+        let hash = hash_content(remote_content.as_bytes());
+        match self.storage.lock() {
+            Ok(store) => {
+                let _ = store.set_synced_hashes(doc_id, &hash);
+                let _ = store.update_sync_status(doc_id, &SyncStatus::Synced);
+                let _ = store.add_sync_history(doc_id, "auto_pull", Some(&hash));
+                let _ = store.save_snapshot(doc_id, remote_content, &hash);
+            }
+            Err(e) => tracing::error!("pull_to_local: storage lock poisoned: {e}"),
+        }
+        self.emit_status(doc_id, SyncStatus::Synced, None);
+        tracing::info!("自动拉取成功: {doc_id}");
+    }
+
+    /// Periodically check remote for changes on all synced docs.
+    ///
+    /// Compares `fresh_remote_hash` against the **cached `remote_hash`** (not `base_hash`).
+    /// This is critical: the write→read roundtrip through lark-cli is NOT byte-identical,
+    /// so `base_hash` (computed from the pushed content) will differ from `remote_hash`
+    /// (computed from the read content) even when nothing changed.
+    ///
+    /// On the first poll after upgrade (remote_hash is NULL), we only **establish the
+    /// baseline** by caching the remote hash. We do NOT pull, because the difference is
+    /// just a formatting artifact, not a real content change.
+    async fn poll_remote_changes(&self) {
+        let docs = match self.storage.lock() {
+            Ok(store) => store.list_synced_docs().unwrap_or_default(),
+            Err(_) => return,
+        };
+
+        if docs.is_empty() {
+            return;
+        }
+
+        tracing::debug!("远端轮询: 检查 {} 个文档", docs.len());
+
+        for doc in &docs {
+            // Skip docs in transient states
+            match &doc.sync_status {
+                SyncStatus::Syncing | SyncStatus::Pulling | SyncStatus::BothModified | SyncStatus::Conflict => continue,
+                _ => {}
+            }
+
+            let _permit = match self.semaphore.acquire().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+
+            // Get cached remote_hash from DB
+            let cached_remote_hash = self.storage.lock()
+                .ok()
+                .and_then(|s| s.get_remote_hash(&doc.doc_id).ok().flatten());
+
+            let read_output = match self.provider.read(&doc.doc_id).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::debug!("远端轮询: 读取 {} 失败: {e}", doc.doc_id);
+                    continue;
+                }
+            };
+
+            let fresh_remote_hash = hash_content(read_output.content.as_bytes());
+
+            // If no cached remote_hash, this is the first poll for this doc.
+            // Just establish the baseline — do NOT pull.
+            if cached_remote_hash.is_none() {
+                tracing::debug!("远端轮询: 建立基线 {} (首次检查)", doc.doc_id);
+                if let Ok(store) = self.storage.lock() {
+                    let _ = store.update_remote_hash(&doc.doc_id, &fresh_remote_hash);
+                }
+                continue;
+            }
+
+            // Compare against cached remote_hash (NOT base_hash)
+            let cached = cached_remote_hash.as_deref().unwrap();
+            if fresh_remote_hash == cached {
+                // Remote unchanged since last check — skip
+                continue;
+            }
+
+            // Remote changed since last check! Update cache.
+            if let Ok(store) = self.storage.lock() {
+                let _ = store.update_remote_hash(&doc.doc_id, &fresh_remote_hash);
+            }
+
+            // Read local to determine if it also changed.
+            let local_hash = if let Some(ref lp) = doc.local_path {
+                match tokio::fs::read(lp).await {
+                    Ok(raw) => {
+                        let content = decode_content(&raw);
+                        hash_content(content.as_bytes())
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                continue;
+            };
+
+            // Dual-space comparison:
+            // remote_changed = true (we already confirmed fresh ≠ cached above)
+            // local_changed = hash(file) ≠ content_hash (local format space)
+            let local_changed = doc.content_hash.as_deref() != Some(local_hash.as_str());
+            let decision = decide(local_changed, true, doc.content_hash.is_some());
+
+            match decision {
+                SyncDecision::PullRemote => {
+                    tracing::info!("远端轮询: 自动拉取 {}", doc.doc_id);
+                    self.pull_to_local(&doc.doc_id, &read_output.content).await;
+                }
+                SyncDecision::BothModified => {
+                    tracing::warn!("远端轮询: 双端冲突 {}", doc.doc_id);
+                    if let Ok(store) = self.storage.lock() {
+                        let _ = store.update_sync_status(&doc.doc_id, &SyncStatus::BothModified);
+                    }
+                    self.emit_status(&doc.doc_id, SyncStatus::BothModified, None);
+                }
+                _ => {}
+            }
+        }
+
+        tracing::debug!("远端轮询完成");
     }
 
     /// Re-create a document on the remote when the original was deleted server-side.
@@ -340,7 +784,9 @@ impl SyncEngine {
                         let _ = store.update_url(new_id, &new_meta.url);
                     }
                 }
-                self.emit_status(new_id, SyncStatus::Synced, Some(title.to_string()));
+                // Emit with OLD doc_id so frontend (which still has old_doc_id in its list)
+                // can match and update. Include new_doc_id so frontend replaces it.
+                self.emit_status_with_new_id(old_doc_id, new_id, SyncStatus::Synced, Some(title.to_string()));
             }
             Err(e) => {
                 tracing::error!("远端重建失败: {old_doc_id}: {e}");
@@ -377,11 +823,103 @@ impl SyncEngine {
         }
     }
 
+    /// Adopt an externally-created .md file.
+    ///
+    /// First checks if an orphaned doc in DB has matching content hash — if so,
+    /// reclaims it (updates local_path) instead of creating a duplicate remote doc.
+    /// Only creates a new remote doc if no match is found.
+    async fn adopt_new_file(&self, path: &PathBuf) {
+        let raw = match tokio::fs::read(path).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("adopt_new_file: cannot read {}: {e}", path.display());
+                return;
+            }
+        };
+        let content = decode_content(&raw);
+        let title = larknotes_core::extract_title(&content);
+        let hash = hash_content(content.as_bytes());
+        let folder = larknotes_core::folder_of(&self.workspace_dir, path);
+        let path_str = path.to_string_lossy().to_string();
+
+        // Check if an orphaned doc has matching content — reclaim instead of creating duplicate
+        let orphan = self.storage.lock()
+            .ok()
+            .and_then(|s| s.find_orphan_by_hash(&hash).ok().flatten());
+
+        if let Some(orphan_doc) = orphan {
+            tracing::info!(
+                "adopt_new_file: 关联已有文档 {} (原路径: {:?}) → {}",
+                orphan_doc.doc_id,
+                orphan_doc.local_path,
+                path.display()
+            );
+            if let Ok(store) = self.storage.lock() {
+                let _ = store.update_local_path(&orphan_doc.doc_id, &path_str);
+                let _ = store.update_folder_path(&orphan_doc.doc_id, &folder);
+                let _ = store.update_content_hash(&orphan_doc.doc_id, &hash);
+            }
+            self.emit_status(&orphan_doc.doc_id, SyncStatus::Synced, Some(orphan_doc.title));
+            return;
+        }
+
+        // No orphan match — create new remote doc
+        match self.provider.create(&title, &content).await {
+            Ok(created) => {
+                let doc_id = created.doc_id.clone();
+                // Ensure unique title within folder
+                let unique_title = self.storage.lock()
+                    .ok()
+                    .and_then(|s| s.unique_title(&title, &folder, Some(&doc_id)).ok())
+                    .unwrap_or_else(|| title.clone());
+                if unique_title != title {
+                    tracing::info!("adopt_new_file: 标题去重 '{title}' → '{unique_title}'");
+                    let _ = self.provider.rename(&doc_id, &unique_title).await;
+                }
+                let meta = DocMeta {
+                    doc_id: doc_id.clone(),
+                    title: unique_title.clone(),
+                    doc_type: created.doc_type.clone(),
+                    url: created.url.clone(),
+                    owner_name: created.owner_name.clone(),
+                    created_at: created.created_at.clone(),
+                    updated_at: created.updated_at.clone(),
+                    local_path: Some(path_str),
+                    content_hash: Some(hash.clone()),
+                    sync_status: SyncStatus::Synced,
+                    folder_path: folder,
+                file_size: None,
+                word_count: None,
+                };
+                if let Ok(store) = self.storage.lock() {
+                    let _ = store.upsert_doc(&meta);
+                    let _ = store.add_sync_history(&doc_id, "adopt_new_file", Some(&hash));
+                    let _ = store.save_snapshot(&doc_id, &content, &hash);
+                }
+                self.emit_status(&doc_id, SyncStatus::Synced, Some(unique_title.clone()));
+                tracing::info!("adopt_new_file: created remote doc for '{unique_title}' → {doc_id}");
+            }
+            Err(e) => {
+                tracing::warn!("adopt_new_file: failed to create remote doc for '{}': {e}", title);
+            }
+        }
+    }
+
     fn emit_status(&self, doc_id: &str, status: SyncStatus, title: Option<String>) {
         let _ = self.status_tx.send(SyncStatusUpdate {
             doc_id: doc_id.to_string(),
             status,
             title,
+            new_doc_id: None,
+        });
+    }
+
+    fn emit_status_with_new_id(&self, old_doc_id: &str, new_doc_id: &str, status: SyncStatus, title: Option<String>) {
+        let _ = self.status_tx.send(SyncStatusUpdate {
+            doc_id: old_doc_id.to_string(),
+            status,
+            title,
+            new_doc_id: Some(new_doc_id.to_string()),
         });
     }
 }
@@ -478,6 +1016,8 @@ mod tests {
                 content_hash: None,
                 sync_status: SyncStatus::Synced,
                 folder_path: String::new(),
+            file_size: None,
+            word_count: None,
             })
         }
         async fn read(&self, _id: &str) -> Result<ReadOutput, LarkNotesError> {
@@ -500,6 +1040,8 @@ mod tests {
                     content_hash: None,
                     sync_status: SyncStatus::Synced,
                     folder_path: String::new(),
+                file_size: None,
+                word_count: None,
                 },
             })
         }
@@ -595,6 +1137,8 @@ mod tests {
             content_hash,
             sync_status: SyncStatus::Synced,
             folder_path: String::new(),
+        file_size: None,
+        word_count: None,
         };
         storage.lock().unwrap().upsert_doc(&meta).unwrap();
         file_path
@@ -708,12 +1252,13 @@ mod tests {
         assert_eq!(new_doc.sync_status, SyncStatus::Synced);
         assert!(new_doc.content_hash.is_some());
 
-        // Status emissions: Syncing, then Synced (with new doc_id)
+        // Status emissions: Syncing, then Synced (with old doc_id + new_doc_id for frontend)
         let update = status_rx.try_recv().unwrap();
         assert_eq!(update.status, SyncStatus::Syncing);
         let update = status_rx.try_recv().unwrap();
         assert_eq!(update.status, SyncStatus::Synced);
-        assert_eq!(update.doc_id, *new_id);
+        assert_eq!(update.doc_id, "deleted_doc");
+        assert_eq!(update.new_doc_id.as_deref(), Some(new_id.as_str()));
     }
 
     #[tokio::test]
@@ -747,7 +1292,7 @@ mod tests {
 
         let engine_clone = engine.clone();
         let handle = tokio::spawn(async move {
-            SyncEngine::run(engine_clone, rx).await;
+            SyncEngine::run(engine_clone, rx, None).await;
         });
 
         for _ in 0..5 {
@@ -781,7 +1326,7 @@ mod tests {
 
         let engine_clone = engine.clone();
         let handle = tokio::spawn(async move {
-            SyncEngine::run(engine_clone, rx).await;
+            SyncEngine::run(engine_clone, rx, None).await;
         });
 
         tx.send(SyncEvent::SyncRequested { doc_id: "doc6".to_string() }).unwrap();
@@ -887,6 +1432,8 @@ mod tests {
             content_hash: None,
             sync_status: SyncStatus::Synced,
             folder_path: String::new(),
+        file_size: None,
+        word_count: None,
         };
         storage.lock().unwrap().upsert_doc(&meta).unwrap();
 
@@ -945,7 +1492,7 @@ mod tests {
 
         let engine_clone = engine.clone();
         let handle = tokio::spawn(async move {
-            SyncEngine::run(engine_clone, rx).await;
+            SyncEngine::run(engine_clone, rx, None).await;
         });
 
         // Fire both docs
@@ -981,7 +1528,7 @@ mod tests {
 
         let engine_clone = engine.clone();
         let handle = tokio::spawn(async move {
-            SyncEngine::run(engine_clone, rx).await;
+            SyncEngine::run(engine_clone, rx, None).await;
         });
 
         tx.send(SyncEvent::SyncRequested { doc_id: "bypass".into() }).unwrap();
@@ -1412,6 +1959,8 @@ mod tests {
             content_hash: Some(hash_content(remote_content.as_bytes())),
             sync_status: SyncStatus::Synced,
             folder_path: String::new(),
+        file_size: None,
+        word_count: None,
         };
         storage.lock().unwrap().upsert_doc(&meta).unwrap();
 
@@ -1604,6 +2153,8 @@ mod tests {
                 created_at: now.clone(), updated_at: now.clone(),
                 local_path: None, content_hash: None,
                 sync_status: SyncStatus::Synced, folder_path: String::new(),
+            file_size: None,
+            word_count: None,
             },
             DocMeta {
                 doc_id: "d2".into(), title: "Doc Two".into(),
@@ -1612,6 +2163,8 @@ mod tests {
                 created_at: now.clone(), updated_at: now,
                 local_path: None, content_hash: None,
                 sync_status: SyncStatus::Synced, folder_path: "sub".into(),
+            file_size: None,
+            word_count: None,
             },
         ]);
         let result = provider.list(None).await.unwrap();

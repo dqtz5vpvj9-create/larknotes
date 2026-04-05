@@ -21,8 +21,19 @@ fn sync_from_remote(
 
     std::fs::create_dir_all(docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
 
-    let new_title = extract_title(content);
-    let ideal_path = unique_content_path(&workspace_dir, &new_title);
+    let raw_title = extract_title(content);
+    // Ensure unique title within folder
+    let folder = meta.folder_path.clone();
+    let new_title = state.storage.lock().map_err(lock_err)?
+        .unique_title(&raw_title, &folder, Some(doc_id))
+        .map_err(|e| e.to_string())?;
+
+    let raw_ideal = titled_content_path_in(&workspace_dir, &folder, &new_title);
+    let ideal_path = if raw_ideal.exists() && old_local_path.as_ref() != Some(&raw_ideal) {
+        unique_content_path_in(&workspace_dir, &folder, &new_title)
+    } else {
+        raw_ideal
+    };
 
     // Rename file if title changed
     let local_path = match &old_local_path {
@@ -52,6 +63,8 @@ fn sync_from_remote(
     {
         let store = state.storage.lock().map_err(lock_err)?;
         store.upsert_doc(meta).map_err(|e| e.to_string())?;
+        // Set both content_hash (base) and remote_hash — they're now in sync
+        store.set_synced_hashes(doc_id, &hash).map_err(|e| e.to_string())?;
         store.add_sync_history(doc_id, action, Some(&hash)).map_err(|e| e.to_string())?;
         store.save_snapshot(doc_id, content, &hash).map_err(|e| e.to_string())?;
     }
@@ -88,12 +101,16 @@ pub async fn create_doc(
     #[allow(unused_variables)]
     folder_path: Option<String>,
 ) -> Result<DocMeta, String> {
-    let title = if title.is_empty() {
+    let raw_title = if title.is_empty() {
         "Untitled".to_string()
     } else {
         title
     };
     let folder = folder_path.unwrap_or_default();
+    // Ensure unique title within folder
+    let title = state.storage.lock().map_err(lock_err)?
+        .unique_title(&raw_title, &folder, None)
+        .map_err(|e| e.to_string())?;
     let markdown = format!("# {title}");
 
     let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
@@ -121,12 +138,12 @@ pub async fn create_doc(
     meta.sync_status = SyncStatus::Synced;
     meta.folder_path = folder;
 
-    state
-        .storage
-        .lock()
-        .map_err(lock_err)?
-        .upsert_doc(&meta)
-        .map_err(|e| e.to_string())?;
+    {
+        let store = state.storage.lock().map_err(lock_err)?;
+        store.upsert_doc(&meta).map_err(|e| e.to_string())?;
+        // Mark for title-based rename after editor closes
+        store.set_pending_rename(&meta.doc_id, true).map_err(|e| e.to_string())?;
+    }
 
     // 3. Write local file + open editor
     std::fs::write(&content_path, &markdown).map_err(|e| e.to_string())?;
@@ -203,26 +220,32 @@ pub async fn open_doc_in_editor(
     };
 
     let editor = state.editor.read().map_err(lock_err)?;
-    match editor.open_file(&cp) {
-        Ok(child) => {
-            let filename = cp.file_name().unwrap().to_string_lossy().to_string();
-            state.window_monitor.track_with_child(&doc_id, &filename, Some(child));
-            Ok(())
-        }
-        Err(e) => Err(e.to_string()),
-    }
+    editor.open_file(&cp).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn get_doc_list(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<DocMeta>, String> {
-    state
+    let mut docs = state
         .storage
         .lock()
         .map_err(lock_err)?
         .list_docs()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // Only compute file_size (cheap metadata call). word_count is skipped here
+    // to avoid reading ALL file contents on every UI refresh / docs-changed event.
+    for doc in &mut docs {
+        if let Some(ref path_str) = doc.local_path {
+            if let Ok(metadata) = std::fs::metadata(path_str) {
+                doc.file_size = Some(metadata.len());
+            }
+        }
+    }
+
+    Ok(docs)
 }
 
 #[tauri::command]
@@ -397,13 +420,22 @@ pub async fn import_doc(
     std::fs::create_dir_all(docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
 
     // 2. Get metadata via search (title, url, owner)
-    let title = extract_title(&content);
+    let raw_title = extract_title(&content);
     let search_results = state
         .provider
-        .search(&title)
+        .search(&raw_title)
         .await
         .unwrap_or_default();
     let remote_meta = search_results.iter().find(|d| d.doc_id == doc_id);
+
+    // Ensure unique title (import goes to root folder)
+    let title = state.storage.lock().map_err(lock_err)?
+        .unique_title(
+            &remote_meta.map(|m| m.title.as_str()).unwrap_or(&raw_title),
+            "",
+            Some(&doc_id),
+        )
+        .map_err(|e| e.to_string())?;
 
     // 3. Write local file
     let content_path = unique_content_path(&workspace_dir, &title);
@@ -413,7 +445,7 @@ pub async fn import_doc(
     let hash = hash_content(content.as_bytes());
     let meta = DocMeta {
         doc_id: doc_id.clone(),
-        title: remote_meta.map(|m| m.title.clone()).unwrap_or_else(|| title.clone()),
+        title: title.clone(),
         doc_type: remote_meta.map(|m| m.doc_type.clone()).unwrap_or_else(|| "DOCX".to_string()),
         url: remote_meta.map(|m| m.url.clone()).unwrap_or_default(),
         owner_name: remote_meta.map(|m| m.owner_name.clone()).unwrap_or_default(),
@@ -423,6 +455,8 @@ pub async fn import_doc(
         content_hash: Some(hash),
         sync_status: SyncStatus::Synced,
         folder_path: String::new(),
+        file_size: None,
+        word_count: None,
     };
 
     state
@@ -435,14 +469,46 @@ pub async fn import_doc(
     // 5. Open in editor
     {
         let editor = state.editor.read().map_err(lock_err)?;
-        match editor.open_file(&content_path) {
-            Ok(child) => {
-                let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
-                state.window_monitor.track_with_child(&doc_id, &filename, Some(child));
-            }
-            Err(e) => tracing::warn!("打开编辑器失败: {e}"),
+        if let Err(e) = editor.open_file(&content_path) {
+            tracing::warn!("打开编辑器失败: {e}");
         }
     }
+
+    Ok(meta)
+}
+
+#[tauri::command]
+pub async fn rename_doc(
+    state: tauri::State<'_, AppState>,
+    doc_id: String,
+    new_title: String,
+) -> Result<DocMeta, String> {
+    // Rename on remote
+    state.provider.rename(&doc_id, &new_title).await.map_err(|e| e.to_string())?;
+
+    let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
+
+    let store = state.storage.lock().map_err(lock_err)?;
+    let mut meta = store.get_doc(&doc_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("doc not found: {doc_id}"))?;
+
+    let old_path = meta.local_path.as_ref().map(std::path::PathBuf::from);
+    let ideal_path = unique_content_path_in(&workspace_dir, &meta.folder_path, &new_title);
+
+    // Rename local file if it exists and name changed
+    if let Some(ref old) = old_path {
+        if old.exists() && *old != ideal_path {
+            if let Err(e) = std::fs::rename(old, &ideal_path) {
+                tracing::warn!("rename_doc: 重命名本地文件失败: {e}");
+            } else {
+                meta.local_path = Some(ideal_path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    meta.title = new_title;
+    store.upsert_doc(&meta).map_err(|e| e.to_string())?;
 
     Ok(meta)
 }
@@ -589,12 +655,12 @@ pub async fn quick_note(
     meta.content_hash = Some(hash);
     meta.sync_status = SyncStatus::Synced;
 
-    state
-        .storage
-        .lock()
-        .map_err(lock_err)?
-        .upsert_doc(&meta)
-        .map_err(|e| e.to_string())?;
+    {
+        let store = state.storage.lock().map_err(lock_err)?;
+        store.upsert_doc(&meta).map_err(|e| e.to_string())?;
+        // Mark for title-based rename after editor closes
+        store.set_pending_rename(&meta.doc_id, true).map_err(|e| e.to_string())?;
+    }
 
     // 3. Write file + open editor
     std::fs::write(&content_path, &markdown).map_err(|e| e.to_string())?;
@@ -783,6 +849,8 @@ pub async fn resolve_conflict(
 
         let store = state.storage.lock().map_err(lock_err)?;
         store.upsert_doc(&meta).map_err(|e| e.to_string())?;
+        // Only update content_hash (local format space). remote_hash lives in
+        // remote format space and will be updated by next poll_remote_changes().
         store.add_sync_history(&doc_id, "push", Some(&hash)).map_err(|e| e.to_string())?;
         store.save_snapshot(&doc_id, &content, &hash).map_err(|e| e.to_string())?;
 

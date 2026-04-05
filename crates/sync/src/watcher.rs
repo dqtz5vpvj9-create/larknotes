@@ -1,16 +1,39 @@
-use crate::reconcile::reconcile_paths;
-use larknotes_core::{docs_dir, folder_of, LarkNotesError};
-use larknotes_storage::Storage;
+use larknotes_core::{docs_dir, LarkNotesError};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
-    event::{CreateKind, ModifyKind, RemoveKind}};
+    event::{CreateKind, ModifyKind, RemoveKind, RenameMode}};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::mpsc;
+
+/// Minimum interval between events on the same path (deduplication window).
+const EVENT_DEDUP_MS: u128 = 100;
 
 #[derive(Debug, Clone)]
 pub enum SyncEvent {
+    /// A tracked .md file was modified (watcher detected content change).
+    /// Engine will look up doc_id from DB and decide whether to sync.
+    FileModified { path: PathBuf },
+    /// Explicitly identified file change with known doc_id (used by engine internally).
     FileChanged { doc_id: String, path: PathBuf },
+    /// A new untracked .md file was detected.
+    NewFileDetected { path: PathBuf },
+    /// Manual sync requested by user.
     SyncRequested { doc_id: String },
+    /// Paired file move: old_path → new_path. Engine updates DB local_path + renames remote.
+    FileMoved { old_path: PathBuf, new_path: PathBuf },
+    /// File deleted from filesystem. Engine should delete from remote + DB.
+    FileDeleted { path: PathBuf },
+    /// Unpaired rename event — engine should run reconcile_paths as fallback.
+    FileRenamed { workspace: PathBuf },
+    /// Folder renamed in filesystem.
+    FolderRenamed { old_rel: String, new_rel: String },
+    /// New folder created in filesystem.
+    FolderCreated { folder_path: String },
+    /// Folder removed from filesystem.
+    FolderRemoved { folder_path: String },
+    /// Shutdown the sync engine.
     Shutdown,
 }
 
@@ -19,19 +42,11 @@ pub struct FileWatcher {
 }
 
 impl FileWatcher {
+    /// Create a new FileWatcher. The watcher does NOT hold a Storage reference —
+    /// it only sends events to the SyncEngine queue for serial processing.
     pub fn new(
         workspace_dir: PathBuf,
         tx: mpsc::UnboundedSender<SyncEvent>,
-        storage: Arc<Mutex<Storage>>,
-    ) -> Result<Self, LarkNotesError> {
-        Self::with_notify(workspace_dir, tx, storage, None)
-    }
-
-    pub fn with_notify(
-        workspace_dir: PathBuf,
-        tx: mpsc::UnboundedSender<SyncEvent>,
-        storage: Arc<Mutex<Storage>>,
-        docs_changed_tx: Option<mpsc::UnboundedSender<()>>,
     ) -> Result<Self, LarkNotesError> {
         let docs_dir = workspace_dir.join("docs");
         std::fs::create_dir_all(&docs_dir)
@@ -39,21 +54,50 @@ impl FileWatcher {
 
         let tx_clone = tx.clone();
         let workspace_clone = workspace_dir.clone();
+        // Event deduplication: track last event time per path to skip rapid-fire duplicates.
+        let recent_events: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let recent_events_clone = recent_events.clone();
+        // Rename pairing: hold a Name(From) event until matching Name(To) arrives.
+        let pending_from: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let pending_from_clone = pending_from.clone();
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
                     match event.kind {
-                        EventKind::Modify(ModifyKind::Name(_)) => {
-                            Self::handle_rename(&event, &workspace_clone, &storage, &tx_clone, &docs_changed_tx);
+                        EventKind::Modify(ModifyKind::Name(rename_mode)) => {
+                            Self::handle_rename(&event, rename_mode, &workspace_clone, &tx_clone, &pending_from_clone);
                         }
                         EventKind::Create(CreateKind::Folder) => {
-                            Self::handle_folder_create(&event, &workspace_clone, &storage, &docs_changed_tx);
+                            Self::handle_folder_create(&event, &workspace_clone, &tx_clone);
                         }
                         EventKind::Remove(RemoveKind::Folder) => {
-                            Self::handle_folder_remove(&event, &workspace_clone, &storage, &docs_changed_tx);
+                            Self::handle_folder_remove(&event, &workspace_clone, &tx_clone);
+                        }
+                        EventKind::Remove(RemoveKind::File) | EventKind::Remove(RemoveKind::Any) => {
+                            Self::handle_file_remove(&event, &tx_clone);
                         }
                         EventKind::Modify(_) | EventKind::Create(_) => {
-                            Self::handle_modify_create(&event, &workspace_clone, &storage, &tx_clone);
+                            // Deduplicate rapid events on the same path
+                            let dominated = {
+                                let mut map = recent_events_clone.lock().unwrap_or_else(|e| e.into_inner());
+                                let now = Instant::now();
+                                // Prune stale entries (> 1s old) to prevent unbounded growth
+                                map.retain(|_, t| now.duration_since(*t).as_millis() < 1000);
+                                let dominated = event.paths.iter().all(|p| {
+                                    if let Some(last) = map.get(p) {
+                                        now.duration_since(*last).as_millis() < EVENT_DEDUP_MS
+                                    } else {
+                                        false
+                                    }
+                                });
+                                for p in &event.paths {
+                                    map.insert(p.clone(), now);
+                                }
+                                dominated
+                            };
+                            if !dominated {
+                                Self::handle_modify_create(&event, &tx_clone);
+                            }
                         }
                         _ => return,
                     }
@@ -76,95 +120,108 @@ impl FileWatcher {
         })
     }
 
+    /// Handle file modify/create events. No DB access — just send event to engine.
     fn handle_modify_create(
         event: &Event,
-        workspace: &std::path::Path,
-        storage: &Arc<Mutex<Storage>>,
         tx: &mpsc::UnboundedSender<SyncEvent>,
     ) {
         for path in &event.paths {
             let is_md = path.extension().and_then(|e| e.to_str()) == Some("md");
             let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !is_md || fname.contains(".conflict-") {
+            if !is_md || fname.contains(".conflict-") || fname.starts_with(".~") {
                 continue;
             }
 
-            let path_str = path.to_string_lossy().to_string();
-            if let Ok(store) = storage.lock() {
-                if let Ok(docs) = store.list_docs() {
-                    for doc in &docs {
-                        if doc.local_path.as_deref() == Some(&path_str) {
-                            tracing::info!(
-                                "检测到文件变更: doc_id={}, file={}",
-                                doc.doc_id, fname
-                            );
-
-                            // Update folder_path if it changed (file moved into subfolder)
-                            let current_folder = folder_of(workspace, path);
-                            if current_folder != doc.folder_path {
-                                let _ = store.update_folder_path(&doc.doc_id, &current_folder);
-                            }
-
-                            let _ = tx.send(SyncEvent::FileChanged {
-                                doc_id: doc.doc_id.clone(),
-                                path: path.clone(),
-                            });
-                            break;
-                        }
-                    }
-                }
-            }
+            // Send to engine — engine will look up DB to determine if this is
+            // a known doc (FileChanged) or new file (NewFileDetected).
+            let _ = tx.send(SyncEvent::FileModified {
+                path: path.clone(),
+            });
         }
     }
 
+    /// Handle rename events with From/To pairing.
+    ///
+    /// On Windows, `notify` sends separate events for Name(From) and Name(To).
+    /// We pair them: hold From, wait for To, emit a single FileMoved event.
+    /// If To arrives without a pending From (or paths are already paired), handle directly.
     fn handle_rename(
         event: &Event,
+        rename_mode: RenameMode,
         workspace: &std::path::Path,
-        storage: &Arc<Mutex<Storage>>,
         tx: &mpsc::UnboundedSender<SyncEvent>,
-        docs_changed_tx: &Option<mpsc::UnboundedSender<()>>,
+        pending_from: &Arc<Mutex<Option<PathBuf>>>,
     ) {
-        tracing::info!(
-            "检测到重命名: {:?}, paths={:?}",
-            event.kind,
-            event.paths
-        );
+        // Case 1: event already has both paths (some platforms pair them)
+        if event.paths.len() == 2 {
+            let old = &event.paths[0];
+            let new = &event.paths[1];
 
-        // Check if this is a folder rename (both paths are directories)
-        let is_folder_rename = event.paths.len() == 2
-            && event.paths[1].is_dir();
+            // Check if folder rename
+            if old.is_dir() || new.is_dir() {
+                Self::handle_folder_rename(event, workspace, tx);
+                return;
+            }
 
-        if is_folder_rename {
-            Self::handle_folder_rename(event, workspace, storage, docs_changed_tx);
+            tracing::info!("检测到文件移动: {} → {}", old.display(), new.display());
+            let _ = tx.send(SyncEvent::FileMoved {
+                old_path: old.clone(),
+                new_path: new.clone(),
+            });
             return;
         }
 
-        let matches = reconcile_paths(workspace, storage);
-
-        for m in &matches {
-            let new_path = PathBuf::from(&m.new_path);
-            tracing::info!(
-                "重命名修复: doc_id={}, {} → {}",
-                m.doc_id,
-                m.old_path.as_deref().unwrap_or("?"),
-                m.new_path
-            );
-
-            // Update folder_path based on new location
-            if let Ok(store) = storage.lock() {
-                let folder = folder_of(workspace, &new_path);
-                let _ = store.update_folder_path(&m.doc_id, &folder);
+        // Case 2: unpaired events — use state machine
+        match rename_mode {
+            RenameMode::From => {
+                if let Some(path) = event.paths.first() {
+                    tracing::debug!("检测到重命名(From): {}", path.display());
+                    let mut guard = pending_from.lock().unwrap_or_else(|e| e.into_inner());
+                    // If there was already a pending From that never got paired, flush it
+                    if let Some(old_pending) = guard.take() {
+                        tracing::debug!("刷新未配对的From: {}", old_pending.display());
+                        let _ = tx.send(SyncEvent::FileRenamed {
+                            workspace: workspace.to_path_buf(),
+                        });
+                    }
+                    *guard = Some(path.clone());
+                }
             }
-
-            let _ = tx.send(SyncEvent::FileChanged {
-                doc_id: m.doc_id.clone(),
-                path: new_path,
-            });
-        }
-
-        if !matches.is_empty() {
-            if let Some(tx) = docs_changed_tx {
-                let _ = tx.send(());
+            RenameMode::To => {
+                if let Some(new_path) = event.paths.first() {
+                    let mut guard = pending_from.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(old_path) = guard.take() {
+                        // Paired! Check if folder rename
+                        if old_path.is_dir() || new_path.is_dir() {
+                            // Reconstruct a 2-path event for folder rename handler
+                            let fake_event = Event {
+                                kind: event.kind,
+                                paths: vec![old_path, new_path.clone()],
+                                attrs: event.attrs.clone(),
+                            };
+                            Self::handle_folder_rename(&fake_event, workspace, tx);
+                        } else {
+                            tracing::info!("检测到文件移动: {} → {}", old_path.display(), new_path.display());
+                            let _ = tx.send(SyncEvent::FileMoved {
+                                old_path,
+                                new_path: new_path.clone(),
+                            });
+                        }
+                    } else {
+                        // To without From — file appeared (could be moved from outside docs/)
+                        tracing::debug!("检测到重命名(To without From): {}", new_path.display());
+                        let _ = tx.send(SyncEvent::FileModified {
+                            path: new_path.clone(),
+                        });
+                    }
+                }
+            }
+            RenameMode::Both | RenameMode::Any | RenameMode::Other => {
+                // Fallback for platforms that don't distinguish From/To
+                tracing::info!("检测到重命名(未配对): paths={:?}", event.paths);
+                let _ = tx.send(SyncEvent::FileRenamed {
+                    workspace: workspace.to_path_buf(),
+                });
             }
         }
     }
@@ -172,8 +229,7 @@ impl FileWatcher {
     fn handle_folder_rename(
         event: &Event,
         workspace: &std::path::Path,
-        storage: &Arc<Mutex<Storage>>,
-        docs_changed_tx: &Option<mpsc::UnboundedSender<()>>,
+        tx: &mpsc::UnboundedSender<SyncEvent>,
     ) {
         if event.paths.len() != 2 {
             return;
@@ -190,36 +246,28 @@ impl FileWatcher {
 
         tracing::info!("文件夹重命名: {} → {}", old_rel, new_rel);
 
-        if let Ok(store) = storage.lock() {
-            let _ = store.rename_folder(&old_rel, &new_rel);
-            // Also update local_path for all affected documents
-            if let Ok(all_docs) = store.list_docs() {
-                let old_dir = docs.join(&*old_rel);
-                let new_dir = docs.join(&*new_rel);
-                for doc in &all_docs {
-                    if let Some(ref lp) = doc.local_path {
-                        let lp_path = std::path::Path::new(lp);
-                        if lp_path.starts_with(&old_dir) {
-                            if let Ok(suffix) = lp_path.strip_prefix(&old_dir) {
-                                let new_lp = new_dir.join(suffix).to_string_lossy().to_string();
-                                let _ = store.update_local_path(&doc.doc_id, &new_lp);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let _ = tx.send(SyncEvent::FolderRenamed { old_rel, new_rel });
+    }
 
-        if let Some(tx) = docs_changed_tx {
-            let _ = tx.send(());
+    fn handle_file_remove(
+        event: &Event,
+        tx: &mpsc::UnboundedSender<SyncEvent>,
+    ) {
+        for path in &event.paths {
+            let is_md = path.extension().and_then(|e| e.to_str()) == Some("md");
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !is_md || fname.contains(".conflict-") || fname.starts_with(".~") {
+                continue;
+            }
+            tracing::info!("检测到文件删除: {}", path.display());
+            let _ = tx.send(SyncEvent::FileDeleted { path: path.clone() });
         }
     }
 
     fn handle_folder_create(
         event: &Event,
         workspace: &std::path::Path,
-        storage: &Arc<Mutex<Storage>>,
-        docs_changed_tx: &Option<mpsc::UnboundedSender<()>>,
+        tx: &mpsc::UnboundedSender<SyncEvent>,
     ) {
         let docs = docs_dir(workspace);
         for path in &event.paths {
@@ -229,12 +277,7 @@ impl FileWatcher {
                     continue;
                 }
                 tracing::info!("新建文件夹: {}", folder_path);
-                if let Ok(store) = storage.lock() {
-                    let _ = store.upsert_folder(&folder_path, None);
-                }
-                if let Some(tx) = docs_changed_tx {
-                    let _ = tx.send(());
-                }
+                let _ = tx.send(SyncEvent::FolderCreated { folder_path });
             }
         }
     }
@@ -242,8 +285,7 @@ impl FileWatcher {
     fn handle_folder_remove(
         event: &Event,
         workspace: &std::path::Path,
-        storage: &Arc<Mutex<Storage>>,
-        docs_changed_tx: &Option<mpsc::UnboundedSender<()>>,
+        tx: &mpsc::UnboundedSender<SyncEvent>,
     ) {
         let docs = docs_dir(workspace);
         for path in &event.paths {
@@ -253,12 +295,7 @@ impl FileWatcher {
                     continue;
                 }
                 tracing::info!("删除文件夹: {}", folder_path);
-                if let Ok(store) = storage.lock() {
-                    let _ = store.delete_folder(&folder_path);
-                }
-                if let Some(tx) = docs_changed_tx {
-                    let _ = tx.send(());
-                }
+                let _ = tx.send(SyncEvent::FolderRemoved { folder_path });
             }
         }
     }
@@ -267,38 +304,17 @@ impl FileWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use larknotes_core::*;
-    use larknotes_storage::Storage;
     use std::time::Duration;
 
     fn setup_watcher_test() -> (
         tempfile::TempDir,
-        Arc<Mutex<Storage>>,
         mpsc::UnboundedReceiver<SyncEvent>,
         FileWatcher,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        let storage = Arc::new(Mutex::new(Storage::new_in_memory().unwrap()));
         let (tx, rx) = mpsc::unbounded_channel();
-        let watcher = FileWatcher::new(tmp.path().to_path_buf(), tx, storage.clone()).unwrap();
-        (tmp, storage, rx, watcher)
-    }
-
-    fn register_doc(storage: &Arc<Mutex<Storage>>, doc_id: &str, local_path: &str) {
-        let meta = DocMeta {
-            doc_id: doc_id.to_string(),
-            title: "Test".to_string(),
-            doc_type: "DOCX".to_string(),
-            url: "".to_string(),
-            owner_name: "test".to_string(),
-            created_at: "2026-01-01".to_string(),
-            updated_at: "2026-01-01".to_string(),
-            local_path: Some(local_path.to_string()),
-            content_hash: None,
-            sync_status: SyncStatus::Synced,
-            folder_path: String::new(),
-        };
-        storage.lock().unwrap().upsert_doc(&meta).unwrap();
+        let watcher = FileWatcher::new(tmp.path().to_path_buf(), tx).unwrap();
+        (tmp, rx, watcher)
     }
 
     #[tokio::test]
@@ -307,21 +323,17 @@ mod tests {
         let docs_dir = tmp.path().join("docs");
         assert!(!docs_dir.exists());
 
-        let storage = Arc::new(Mutex::new(Storage::new_in_memory().unwrap()));
         let (tx, _rx) = mpsc::unbounded_channel();
-        let _watcher = FileWatcher::new(tmp.path().to_path_buf(), tx, storage).unwrap();
+        let _watcher = FileWatcher::new(tmp.path().to_path_buf(), tx).unwrap();
 
         assert!(docs_dir.exists(), "FileWatcher should create docs/ directory");
     }
 
     #[tokio::test]
     async fn test_watcher_md_file_triggers_event() {
-        let (tmp, storage, mut rx, _watcher) = setup_watcher_test();
+        let (tmp, mut rx, _watcher) = setup_watcher_test();
         let docs_dir = tmp.path().join("docs");
         let file_path = docs_dir.join("test.md");
-        let file_path_str = file_path.to_string_lossy().to_string();
-
-        register_doc(&storage, "doc1", &file_path_str);
 
         // Write the file
         std::fs::write(&file_path, "# Hello").unwrap();
@@ -329,18 +341,18 @@ mod tests {
         // Wait for event (file watchers can be slow)
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
         match event {
-            Ok(Some(SyncEvent::FileChanged { doc_id, .. })) => {
-                assert_eq!(doc_id, "doc1");
+            Ok(Some(SyncEvent::FileModified { path })) => {
+                assert!(path.ends_with("test.md"));
             }
-            Ok(Some(other)) => panic!("Expected FileChanged, got {other:?}"),
+            Ok(Some(other)) => panic!("Expected FileModified, got {other:?}"),
             Ok(None) => panic!("Channel closed"),
-            Err(_) => panic!("Timed out waiting for FileChanged event"),
+            Err(_) => panic!("Timed out waiting for FileModified event"),
         }
     }
 
     #[tokio::test]
     async fn test_watcher_ignores_txt_file() {
-        let (tmp, _storage, mut rx, _watcher) = setup_watcher_test();
+        let (tmp, mut rx, _watcher) = setup_watcher_test();
         let docs_dir = tmp.path().join("docs");
 
         // Write a .txt file
@@ -353,11 +365,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_watcher_ignores_conflict_file() {
-        let (tmp, storage, mut rx, _watcher) = setup_watcher_test();
+        let (tmp, mut rx, _watcher) = setup_watcher_test();
         let docs_dir = tmp.path().join("docs");
         let conflict_file = docs_dir.join("test.conflict-20260101-120000.md");
-
-        register_doc(&storage, "doc1", &conflict_file.to_string_lossy().to_string());
 
         std::fs::write(&conflict_file, "# Conflict").unwrap();
 
@@ -366,40 +376,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_watcher_ignores_unregistered_file() {
-        let (tmp, _storage, mut rx, _watcher) = setup_watcher_test();
+    async fn test_watcher_detects_unregistered_file() {
+        let (tmp, mut rx, _watcher) = setup_watcher_test();
         let docs_dir = tmp.path().join("docs");
 
-        // Write .md file not registered in storage
+        // Write .md file — watcher sends FileModified (engine will determine if new)
         std::fs::write(docs_dir.join("unknown.md"), "# Unknown").unwrap();
 
-        let result = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
-        assert!(result.is_err(), "Should not receive event for unregistered file");
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        match event {
+            Ok(Some(SyncEvent::FileModified { path })) => {
+                assert!(path.ends_with("unknown.md"));
+            }
+            Ok(Some(other)) => panic!("Expected FileModified, got {other:?}"),
+            Ok(None) => panic!("Channel closed"),
+            Err(_) => panic!("Timed out waiting for FileModified event"),
+        }
     }
 
     #[tokio::test]
     async fn test_watcher_subfolder_file_triggers_event() {
-        let (tmp, storage, mut rx, _watcher) = setup_watcher_test();
+        let (tmp, mut rx, _watcher) = setup_watcher_test();
         let sub_dir = tmp.path().join("docs").join("project-a");
         std::fs::create_dir_all(&sub_dir).unwrap();
-
-        let file_path = sub_dir.join("note.md");
-        let file_path_str = file_path.to_string_lossy().to_string();
-        register_doc(&storage, "doc1", &file_path_str);
 
         // Small delay for watcher to register the new subdir
         tokio::time::sleep(Duration::from_millis(200)).await;
 
+        let file_path = sub_dir.join("note.md");
         std::fs::write(&file_path, "# Note").unwrap();
 
-        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
-        match event {
-            Ok(Some(SyncEvent::FileChanged { doc_id, .. })) => {
-                assert_eq!(doc_id, "doc1");
+        // May receive FolderCreated first, then FileModified
+        let mut got_file_event = false;
+        for _ in 0..5 {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(SyncEvent::FileModified { path })) if path.ends_with("note.md") => {
+                    got_file_event = true;
+                    break;
+                }
+                Ok(Some(_)) => continue, // skip folder events
+                _ => break,
             }
-            Ok(Some(other)) => panic!("Expected FileChanged, got {other:?}"),
-            Ok(None) => panic!("Channel closed"),
-            Err(_) => panic!("Timed out — recursive watcher may not have detected subfolder change"),
         }
+        assert!(got_file_event, "Should receive FileModified for subfolder file");
     }
 }
