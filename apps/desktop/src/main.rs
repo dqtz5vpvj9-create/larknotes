@@ -11,7 +11,8 @@ use tauri::tray::TrayIconBuilder;
 use larknotes_editor::{detect_editor, EditorLauncher};
 use larknotes_provider_cli::CliProvider;
 use larknotes_storage::Storage;
-use larknotes_sync::{FileWatcher, SyncEngine, SyncEvent, scan_orphan_files};
+use larknotes_sync::{FileWatcher, Scheduler, SyncEvent, WriteGuard, scan_orphan_files};
+use larknotes_sync::executor::SyncStatusUpdate;
 use state::AppState;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -166,21 +167,25 @@ fn main() {
             // 6. Init editor
             let editor = Arc::new(RwLock::new(EditorLauncher::new(&editor_command)));
 
-            // 7. Init sync channel + engine
+            // 7. Init sync channel + scheduler
             let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (sync_engine, _status_rx) = SyncEngine::new(
+            let write_guard = WriteGuard::new();
+            let (status_tx, _status_rx) = tokio::sync::broadcast::channel::<SyncStatusUpdate>(64);
+            let scheduler = Arc::new(Scheduler::new(
                 provider.clone(),
                 storage.clone(),
                 workspace.clone(),
                 debounce_ms.clone(),
-            );
-            let sync_engine = Arc::new(sync_engine);
+                write_guard.clone(),
+                status_tx.clone(),
+                config.clone(),
+            ));
 
             // 8. Start file watcher — stored in app managed state to prevent drop
             //    Watcher does NOT hold storage — sends events to engine for serial processing.
             let (docs_changed_tx, mut docs_changed_rx) = tokio::sync::mpsc::unbounded_channel();
             let watcher = FileWatcher::new(
-                workspace.clone(), sync_tx.clone(),
+                workspace.clone(), sync_tx.clone(), Some(write_guard.clone()),
             ).expect("Failed to start file watcher");
             app.manage(watcher);
 
@@ -192,11 +197,11 @@ fn main() {
                 }
             });
 
-            // 9. Spawn sync engine + status relay
-            let engine = sync_engine.clone();
+            // 9. Spawn scheduler + status relay
+            let sched = scheduler.clone();
             let handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                let mut status_rx = engine.status_receiver();
+                let mut status_rx = status_tx.subscribe();
                 let relay_handle = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
@@ -210,7 +215,7 @@ fn main() {
                     }
                 });
 
-                SyncEngine::run(engine, sync_rx, Some(docs_changed_tx)).await;
+                Scheduler::run(sched, sync_rx, Some(docs_changed_tx)).await;
             });
 
             // 9b. Adopt orphan .md files created while app was closed.
@@ -324,6 +329,7 @@ fn main() {
                 config,
                 editor,
                 debounce_ms,
+                write_guard,
                 window_monitor,
                 cli_provider,
             });
@@ -372,13 +378,17 @@ fn main() {
         .expect("error while building LarkNotes")
         .run(|app, event| {
             match event {
-                tauri::RunEvent::ExitRequested { api, .. } => {
+                tauri::RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::CloseRequested { api, .. },
+                    ..
+                } if label == "main" => {
                     let is_quitting = app
                         .try_state::<QuittingFlag>()
                         .map_or(false, |f| f.0.load(Ordering::SeqCst));
                     if !is_quitting {
-                        // Prevent exit — minimize to tray instead
-                        api.prevent_exit();
+                        // Prevent window destruction — hide to tray instead
+                        api.prevent_close();
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.hide();
                         }

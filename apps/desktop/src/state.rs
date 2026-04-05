@@ -2,6 +2,7 @@ use larknotes_core::{AppConfig, DocProvider, ProviderAuth};
 use larknotes_editor::window_monitor::WindowMonitor;
 use larknotes_editor::EditorLauncher;
 use larknotes_storage::Storage;
+use larknotes_sync::write_guard::WriteGuard;
 use larknotes_sync::SyncEvent;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
@@ -15,6 +16,7 @@ pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub editor: Arc<RwLock<EditorLauncher>>,
     pub debounce_ms: Arc<AtomicU64>,
+    pub write_guard: WriteGuard,
     /// Monitors editor windows. When a window closes (filename disappears
     /// from all window titles), the background task renames the file.
     pub window_monitor: Arc<WindowMonitor>,

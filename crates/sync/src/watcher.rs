@@ -1,3 +1,4 @@
+use crate::write_guard::WriteGuard;
 use larknotes_core::{docs_dir, LarkNotesError};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{CreateKind, ModifyKind, RemoveKind, RenameMode}};
@@ -47,6 +48,7 @@ impl FileWatcher {
     pub fn new(
         workspace_dir: PathBuf,
         tx: mpsc::UnboundedSender<SyncEvent>,
+        write_guard: Option<WriteGuard>,
     ) -> Result<Self, LarkNotesError> {
         let docs_dir = workspace_dir.join("docs");
         std::fs::create_dir_all(&docs_dir)
@@ -54,6 +56,7 @@ impl FileWatcher {
 
         let tx_clone = tx.clone();
         let workspace_clone = workspace_dir.clone();
+        let write_guard_clone = write_guard.clone();
         // Event deduplication: track last event time per path to skip rapid-fire duplicates.
         let recent_events: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
         let recent_events_clone = recent_events.clone();
@@ -96,7 +99,7 @@ impl FileWatcher {
                                 dominated
                             };
                             if !dominated {
-                                Self::handle_modify_create(&event, &tx_clone);
+                                Self::handle_modify_create(&event, &tx_clone, &write_guard_clone);
                             }
                         }
                         _ => return,
@@ -124,12 +127,21 @@ impl FileWatcher {
     fn handle_modify_create(
         event: &Event,
         tx: &mpsc::UnboundedSender<SyncEvent>,
+        write_guard: &Option<WriteGuard>,
     ) {
         for path in &event.paths {
             let is_md = path.extension().and_then(|e| e.to_str()) == Some("md");
             let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !is_md || fname.contains(".conflict-") || fname.starts_with(".~") {
                 continue;
+            }
+
+            // Skip paths currently being written by the executor
+            if let Some(ref wg) = write_guard {
+                if wg.is_guarded(path) {
+                    tracing::debug!("watcher: 跳过被write_guard保护的路径: {}", path.display());
+                    continue;
+                }
             }
 
             // Send to engine — engine will look up DB to determine if this is
@@ -313,7 +325,7 @@ mod tests {
     ) {
         let tmp = tempfile::tempdir().unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
-        let watcher = FileWatcher::new(tmp.path().to_path_buf(), tx).unwrap();
+        let watcher = FileWatcher::new(tmp.path().to_path_buf(), tx, None).unwrap();
         (tmp, rx, watcher)
     }
 
@@ -324,7 +336,7 @@ mod tests {
         assert!(!docs_dir.exists());
 
         let (tx, _rx) = mpsc::unbounded_channel();
-        let _watcher = FileWatcher::new(tmp.path().to_path_buf(), tx).unwrap();
+        let _watcher = FileWatcher::new(tmp.path().to_path_buf(), tx, None).unwrap();
 
         assert!(docs_dir.exists(), "FileWatcher should create docs/ directory");
     }

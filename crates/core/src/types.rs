@@ -2,8 +2,32 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use unicode_segmentation::UnicodeSegmentation;
 
+// ─── Hash newtypes (P5: never mix local/remote hash domains) ─────
+
+/// SHA-256 hash of decoded local file content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHash(pub String);
+
+/// SHA-256 hash of remote content from provider.read().
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteHash(pub String);
+
+// ─── Note identity ──────────────────────────────────────────────
+
+/// Generate a new local note identity (UUID v4).
+pub fn new_note_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocMeta {
+    /// Local immutable identity (UUID). Primary key in notes table.
+    pub note_id: String,
+    /// Remote document ID (e.g. Lark doc_id). Nullable, replaceable.
+    pub remote_id: Option<String>,
+    /// Backward compat with frontend — always mirrors note_id.
+    /// NEVER set to remote_id; use the `remote_id` field for remote identity.
+    #[serde(default)]
     pub doc_id: String,
     pub title: String,
     pub doc_type: String,
@@ -23,6 +47,18 @@ pub struct DocMeta {
     /// Word count (computed, not stored in DB). Uses UAX#29 segmentation.
     #[serde(default)]
     pub word_count: Option<usize>,
+    /// Sync state in the new architecture.
+    #[serde(default)]
+    pub sync_state: SyncState,
+    /// Title derivation mode for quick notes.
+    #[serde(default = "default_title_mode")]
+    pub title_mode: String,
+    /// Desired title for pending rename operations. None = no rename desired.
+    #[serde(default)]
+    pub desired_title: Option<String>,
+    /// Desired local path for pending move operations. None = no move desired.
+    #[serde(default)]
+    pub desired_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +101,41 @@ impl Default for SyncStatus {
     }
 }
 
+fn default_title_mode() -> String {
+    "manual".to_string()
+}
+
+/// New sync state machine (P4 architecture).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SyncState {
+    Synced,
+    LocalModified,
+    RemoteModified,
+    BothModified,
+    Executing,
+    Conflict,
+    PendingCreate,
+    PendingDelete,
+    PendingRename,
+    Error(String),
+    FileMissing,
+}
+
+impl Default for SyncState {
+    fn default() -> Self {
+        Self::Synced
+    }
+}
+
+impl std::fmt::Display for SyncState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Error(msg) => write!(f, "Error:{msg}"),
+            other => write!(f, "{:?}", other),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthStatus {
     pub logged_in: bool,
@@ -100,6 +171,9 @@ impl Default for AppConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncHistoryEntry {
     pub id: i64,
+    pub note_id: String,
+    /// Legacy alias — mirrors note_id for frontend compat.
+    #[serde(default)]
     pub doc_id: String,
     pub action: String,
     pub content_hash: Option<String>,
@@ -109,6 +183,9 @@ pub struct SyncHistoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionSnapshot {
     pub id: i64,
+    pub note_id: String,
+    /// Legacy alias — mirrors note_id for frontend compat.
+    #[serde(default)]
     pub doc_id: String,
     pub content: String,
     pub content_hash: String,
@@ -217,9 +294,10 @@ pub fn meta_dir(workspace: &Path) -> PathBuf {
     workspace.join(".meta")
 }
 
-/// Returns the meta file path: `workspace/.meta/<doc_id>.json`
-pub fn meta_path(workspace: &Path, doc_id: &str) -> PathBuf {
-    meta_dir(workspace).join(format!("{doc_id}.json"))
+/// Returns the meta file path: `workspace/.meta/<id>.json`
+/// Accepts either note_id or doc_id (legacy).
+pub fn meta_path(workspace: &Path, id: &str) -> PathBuf {
+    meta_dir(workspace).join(format!("{id}.json"))
 }
 
 /// Extract title from markdown content (first H1 line)

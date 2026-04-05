@@ -1,5 +1,6 @@
 use crate::state::AppState;
 use larknotes_core::*;
+use larknotes_core::{new_note_id, SyncState};
 use larknotes_editor::EditorLauncher;
 use larknotes_sync::{hash_content, SyncEvent};
 
@@ -121,43 +122,56 @@ pub async fn create_doc(
     };
     std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
 
-    // 1. Create remote doc first (the slow part, ~1-2s)
-    let mut meta = state
-        .provider
-        .create(&title, &markdown)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 2. Store in DB with the correct hash BEFORE writing the local file.
-    //    This prevents the file watcher from seeing a new file without a
-    //    matching doc_id/hash in the DB and triggering an unwanted sync.
+    // Desired-state: create note locally with PendingCreate state.
+    // Executor will asynchronously create the remote doc.
+    let note_id = new_note_id();
     let content_path = unique_content_path_in(&workspace_dir, &folder, &title);
     let hash = hash_content(markdown.as_bytes());
-    meta.local_path = Some(content_path.to_string_lossy().to_string());
-    meta.content_hash = Some(hash);
-    meta.sync_status = SyncStatus::Synced;
-    meta.folder_path = folder;
+
+    let meta = DocMeta {
+        note_id: note_id.clone(),
+        remote_id: None,
+        doc_id: note_id.clone(), // Temporary — will be replaced when remote doc created
+        title: title.clone(),
+        doc_type: "DOCX".to_string(),
+        url: String::new(),
+        owner_name: String::new(),
+        created_at: chrono::Local::now().to_rfc3339(),
+        updated_at: chrono::Local::now().to_rfc3339(),
+        local_path: Some(content_path.to_string_lossy().to_string()),
+        content_hash: Some(hash),
+        sync_status: SyncStatus::New,
+        folder_path: folder,
+        file_size: None,
+        word_count: None,
+        sync_state: SyncState::PendingCreate,
+        title_mode: "manual".to_string(),
+        desired_title: None,
+        desired_path: None,
+    };
 
     {
         let store = state.storage.lock().map_err(lock_err)?;
         store.upsert_doc(&meta).map_err(|e| e.to_string())?;
-        // Mark for title-based rename after editor closes
-        store.set_pending_rename(&meta.doc_id, true).map_err(|e| e.to_string())?;
     }
 
-    // 3. Write local file + open editor
+    // Write local file
     std::fs::write(&content_path, &markdown).map_err(|e| e.to_string())?;
 
+    // Open editor
     {
         let editor = state.editor.read().map_err(lock_err)?;
         match editor.open_file(&content_path) {
             Ok(child) => {
                 let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
-                state.window_monitor.track_with_child(&meta.doc_id, &filename, Some(child));
+                state.window_monitor.track_with_child(&note_id, &filename, Some(child));
             }
             Err(e) => tracing::warn!("打开编辑器失败: {e}"),
         }
     }
+
+    // Notify scheduler to process the PendingCreate
+    let _ = state.sync_tx.send(SyncEvent::SyncRequested { doc_id: note_id.clone() });
 
     Ok(meta)
 }
@@ -443,8 +457,11 @@ pub async fn import_doc(
 
     // 4. Build and store meta
     let hash = hash_content(content.as_bytes());
+    let import_note_id = new_note_id();
     let meta = DocMeta {
-        doc_id: doc_id.clone(),
+        note_id: import_note_id.clone(),
+        remote_id: Some(doc_id.clone()),
+        doc_id: import_note_id.clone(),
         title: title.clone(),
         doc_type: remote_meta.map(|m| m.doc_type.clone()).unwrap_or_else(|| "DOCX".to_string()),
         url: remote_meta.map(|m| m.url.clone()).unwrap_or_default(),
@@ -457,6 +474,10 @@ pub async fn import_doc(
         folder_path: String::new(),
         file_size: None,
         word_count: None,
+        sync_state: SyncState::Synced,
+        title_mode: "manual".to_string(),
+        desired_title: None,
+        desired_path: None,
     };
 
     state
@@ -483,9 +504,6 @@ pub async fn rename_doc(
     doc_id: String,
     new_title: String,
 ) -> Result<DocMeta, String> {
-    // Rename on remote
-    state.provider.rename(&doc_id, &new_title).await.map_err(|e| e.to_string())?;
-
     let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
 
     let store = state.storage.lock().map_err(lock_err)?;
@@ -493,10 +511,9 @@ pub async fn rename_doc(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("doc not found: {doc_id}"))?;
 
+    // Rename local file if it exists
     let old_path = meta.local_path.as_ref().map(std::path::PathBuf::from);
     let ideal_path = unique_content_path_in(&workspace_dir, &meta.folder_path, &new_title);
-
-    // Rename local file if it exists and name changed
     if let Some(ref old) = old_path {
         if old.exists() && *old != ideal_path {
             if let Err(e) = std::fs::rename(old, &ideal_path) {
@@ -507,8 +524,15 @@ pub async fn rename_doc(
         }
     }
 
-    meta.title = new_title;
+    // Desired-state: set desired_title, mark PendingRename → executor renames remote
+    meta.title = new_title.clone();
+    meta.desired_title = Some(new_title);
+    meta.sync_state = SyncState::PendingRename;
     store.upsert_doc(&meta).map_err(|e| e.to_string())?;
+    drop(store);
+
+    // Notify scheduler
+    let _ = state.sync_tx.send(SyncEvent::SyncRequested { doc_id: doc_id.clone() });
 
     Ok(meta)
 }
@@ -519,29 +543,42 @@ pub async fn delete_doc(
     doc_id: String,
     force_local: Option<bool>,
 ) -> Result<(), String> {
-    // Try remote delete first (unless user already confirmed local-only)
-    if !force_local.unwrap_or(false) {
-        if let Err(e) = state.provider.delete(&doc_id).await {
-            // Return error with a prefix so frontend can distinguish and show confirm dialog
-            return Err(format!("REMOTE_DELETE_FAILED:{e}"));
+    // Desired-state: mark as PendingDelete, executor handles remote deletion.
+    // If force_local, skip remote and just clean up.
+    if force_local.unwrap_or(false) {
+        // Force local-only: delete local file + meta + DB.
+        // Order: file (under write_guard) → meta → DB (last, for crash recovery)
+        let (local_path, note_id) = {
+            let store = state.storage.lock().map_err(lock_err)?;
+            let doc = store.get_doc(&doc_id).ok().flatten();
+            let path = doc.as_ref().and_then(|d| d.local_path.clone());
+            let nid = doc.map(|d| d.note_id).unwrap_or_else(|| doc_id.clone());
+            (path, nid)
+        };
+        if let Some(ref path) = local_path {
+            let _guard = state.write_guard.guard(std::path::Path::new(path));
+            let _ = std::fs::remove_file(path);
+        }
+        let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
+        let _ = std::fs::remove_file(meta_path(&workspace_dir, &note_id));
+        // DB delete last — if crash happens before this, doc still in DB and can be cleaned up
+        state.storage.lock().map_err(lock_err)?.delete_doc(&doc_id).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    // Mark as PendingDelete — executor will delete remote + cleanup
+    {
+        let store = state.storage.lock().map_err(lock_err)?;
+        if let Some(mut doc) = store.get_doc(&doc_id).map_err(|e| e.to_string())? {
+            doc.sync_state = SyncState::PendingDelete;
+            store.upsert_doc(&doc).map_err(|e| e.to_string())?;
+        } else {
+            return Err("文档不存在".to_string());
         }
     }
 
-    // Delete from DB and local file
-    let local_path = {
-        let store = state.storage.lock().map_err(lock_err)?;
-        let path = store.get_doc(&doc_id).ok().flatten().and_then(|d| d.local_path);
-        store.delete_doc(&doc_id).map_err(|e| e.to_string())?;
-        path
-    };
-
-    if let Some(path) = local_path {
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // Delete meta JSON
-    let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
-    let _ = std::fs::remove_file(meta_path(&workspace_dir, &doc_id));
+    // Notify scheduler
+    let _ = state.sync_tx.send(SyncEvent::SyncRequested { doc_id: doc_id.clone() });
 
     Ok(())
 }
@@ -641,28 +678,39 @@ pub async fn quick_note(
     let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
     std::fs::create_dir_all(docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
 
-    // 1. Create remote doc first
-    let mut meta = state
-        .provider
-        .create(&title, &markdown)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 2. DB insert BEFORE file write (prevents watcher race)
+    // Desired-state: create locally with PendingCreate + title_mode=derive_once
+    let note_id = new_note_id();
     let content_path = unique_content_path(&workspace_dir, &title);
     let hash = hash_content(markdown.as_bytes());
-    meta.local_path = Some(content_path.to_string_lossy().to_string());
-    meta.content_hash = Some(hash);
-    meta.sync_status = SyncStatus::Synced;
+
+    let meta = DocMeta {
+        note_id: note_id.clone(),
+        remote_id: None,
+        doc_id: note_id.clone(),
+        title: title.clone(),
+        doc_type: "DOCX".to_string(),
+        url: String::new(),
+        owner_name: String::new(),
+        created_at: chrono::Local::now().to_rfc3339(),
+        updated_at: chrono::Local::now().to_rfc3339(),
+        local_path: Some(content_path.to_string_lossy().to_string()),
+        content_hash: Some(hash),
+        sync_status: SyncStatus::New,
+        folder_path: String::new(),
+        file_size: None,
+        word_count: None,
+        sync_state: SyncState::PendingCreate,
+        title_mode: "derive_once".to_string(),
+        desired_title: None,
+        desired_path: None,
+    };
 
     {
         let store = state.storage.lock().map_err(lock_err)?;
         store.upsert_doc(&meta).map_err(|e| e.to_string())?;
-        // Mark for title-based rename after editor closes
-        store.set_pending_rename(&meta.doc_id, true).map_err(|e| e.to_string())?;
     }
 
-    // 3. Write file + open editor
+    // Write file + open editor
     std::fs::write(&content_path, &markdown).map_err(|e| e.to_string())?;
 
     {
@@ -670,11 +718,14 @@ pub async fn quick_note(
         match editor.open_file(&content_path) {
             Ok(child) => {
                 let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
-                state.window_monitor.track_with_child(&meta.doc_id, &filename, Some(child));
+                state.window_monitor.track_with_child(&note_id, &filename, Some(child));
             }
             Err(e) => tracing::warn!("打开编辑器失败: {e}"),
         }
     }
+
+    // Notify scheduler
+    let _ = state.sync_tx.send(SyncEvent::SyncRequested { doc_id: note_id.clone() });
 
     Ok(meta)
 }

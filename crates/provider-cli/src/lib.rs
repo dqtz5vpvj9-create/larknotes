@@ -280,8 +280,11 @@ pub fn parse_search_results(json: &serde_json::Value) -> Vec<DocMeta> {
             .unwrap_or("")
             .to_string();
 
+        let note_id = new_note_id();
         docs.push(DocMeta {
-            doc_id,
+            note_id: note_id.clone(),
+            remote_id: Some(doc_id),
+            doc_id: note_id,
             title,
             doc_type,
             url,
@@ -294,6 +297,10 @@ pub fn parse_search_results(json: &serde_json::Value) -> Vec<DocMeta> {
             folder_path: String::new(),
             file_size: None,
             word_count: None,
+            sync_state: SyncState::Synced,
+            title_mode: "manual".to_string(),
+            desired_title: None,
+            desired_path: None,
         });
     }
 
@@ -317,8 +324,12 @@ pub fn parse_create_response(
         .to_string();
 
     let now = chrono::Local::now().to_rfc3339();
+    // note_id left empty — caller MUST set note_id AND doc_id before DB use.
+    // Only remote_id is meaningful from provider.
     Ok(DocMeta {
-        doc_id,
+        note_id: String::new(),
+        remote_id: Some(doc_id),
+        doc_id: String::new(),
         title: title.to_string(),
         doc_type: "DOCX".to_string(),
         url,
@@ -331,6 +342,10 @@ pub fn parse_create_response(
         folder_path: String::new(),
         file_size: None,
         word_count: None,
+        sync_state: SyncState::Synced,
+        title_mode: "manual".to_string(),
+        desired_title: None,
+        desired_path: None,
     })
 }
 
@@ -381,8 +396,12 @@ impl DocProvider for CliProvider {
         let doc_id_from_resp = json.pointer("/data/doc_id")
             .and_then(|v| v.as_str())
             .unwrap_or(id);
+        // note_id left empty — caller MUST set note_id AND doc_id before DB use.
+        // Only remote_id is meaningful from provider.
         let meta = DocMeta {
-            doc_id: doc_id_from_resp.to_string(),
+            note_id: String::new(),
+            remote_id: Some(doc_id_from_resp.to_string()),
+            doc_id: String::new(),
             title,
             doc_type: "DOCX".to_string(),
             url,
@@ -395,6 +414,10 @@ impl DocProvider for CliProvider {
             folder_path: String::new(),
             file_size: None,
             word_count: None,
+            sync_state: SyncState::Synced,
+            title_mode: "manual".to_string(),
+            desired_title: None,
+            desired_path: None,
         };
         Ok(ReadOutput { content, meta })
     }
@@ -548,7 +571,9 @@ mod tests {
 
         let docs = parse_search_results(&json);
         assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].doc_id, "ENX3dkjCjoSbIRxPtRYcONgmnGh");
+        assert_eq!(docs[0].remote_id.as_deref(), Some("ENX3dkjCjoSbIRxPtRYcONgmnGh"));
+        // doc_id mirrors note_id (a UUID), NOT the remote id
+        assert_eq!(docs[0].doc_id, docs[0].note_id);
         assert_eq!(docs[0].title, "LarkNotes测试");
         assert_eq!(docs[0].owner_name, "李新锐");
         assert_eq!(docs[0].doc_type, "DOCX");
@@ -598,9 +623,9 @@ mod tests {
 
         let docs = parse_search_results(&json);
         assert_eq!(docs.len(), 2);
-        assert_eq!(docs[0].doc_id, "doc1");
+        assert_eq!(docs[0].remote_id.as_deref(), Some("doc1"));
         assert_eq!(docs[0].title, "First");
-        assert_eq!(docs[1].doc_id, "doc2");
+        assert_eq!(docs[1].remote_id.as_deref(), Some("doc2"));
         assert_eq!(docs[1].title, "Second");
     }
 
@@ -616,7 +641,9 @@ mod tests {
         }"#).unwrap();
 
         let meta = parse_create_response(&json, "IntegrationTest").unwrap();
-        assert_eq!(meta.doc_id, "VT5rd9n3WoAVKkxkT5Kc3XyQnJh");
+        assert_eq!(meta.remote_id.as_deref(), Some("VT5rd9n3WoAVKkxkT5Kc3XyQnJh"));
+        // doc_id is empty — caller must set it to note_id
+        assert!(meta.doc_id.is_empty());
         assert_eq!(meta.title, "IntegrationTest");
         assert_eq!(meta.url, "https://www.feishu.cn/docx/VT5rd9n3WoAVKkxkT5Kc3XyQnJh");
         assert_eq!(meta.doc_type, "DOCX");
@@ -750,7 +777,7 @@ mod tests {
 
         let docs = parse_search_results(&json);
         assert_eq!(docs.len(), 1);
-        assert_eq!(docs[0].doc_id, "abc");
+        assert_eq!(docs[0].remote_id.as_deref(), Some("abc"));
         assert_eq!(docs[0].url, "");
         assert_eq!(docs[0].owner_name, "");
     }
@@ -763,7 +790,7 @@ mod tests {
         }"#).unwrap();
 
         let meta = parse_create_response(&json, "Test").unwrap();
-        assert_eq!(meta.doc_id, "xyz");
+        assert_eq!(meta.remote_id.as_deref(), Some("xyz"));
         assert_eq!(meta.url, ""); // Missing url defaults to empty
     }
 
@@ -809,18 +836,19 @@ mod tests {
         let title = format!("TestDoc-{}", chrono::Local::now().format("%H%M%S"));
         let markdown = format!("# {title}\n\nCreated by integration test.");
         let meta = provider.create(&title, &markdown).await.unwrap();
-        assert!(!meta.doc_id.is_empty(), "doc_id should not be empty");
-        assert!(meta.url.contains(&meta.doc_id), "url should contain doc_id");
+        let rid = meta.remote_id.as_deref().unwrap();
+        assert!(!rid.is_empty(), "remote_id should not be empty");
+        assert!(meta.url.contains(rid), "url should contain remote_id");
 
         // Fetch
-        let fetched = provider.read(&meta.doc_id).await.unwrap();
+        let fetched = provider.read(rid).await.unwrap();
         // Note: fetched content may be empty initially (async indexing)
         // Just verify the call succeeds
         let _ = fetched;
 
         // Update
         let updated_md = format!("# {title}\n\nUpdated by integration test.");
-        provider.write(&meta.doc_id, &updated_md).await.unwrap();
+        provider.write(rid, &updated_md).await.unwrap();
 
         // Search
         let results = provider.search(&title).await.unwrap();
@@ -836,9 +864,9 @@ mod tests {
         let results = provider.search("测试").await.unwrap();
         // Should return at least one result (from our earlier test docs)
         assert!(!results.is_empty(), "Expected search results for '测试'");
-        // Each result should have a doc_id
+        // Each result should have a remote_id
         for doc in &results {
-            assert!(!doc.doc_id.is_empty());
+            assert!(doc.remote_id.is_some() && !doc.remote_id.as_ref().unwrap().is_empty());
         }
     }
 
@@ -981,10 +1009,11 @@ mod tests {
         let title = test_title("create_ok");
         let md = format!("# {title}\n\nCreated by integration test.");
         let meta = p.create(&title, &md).await.unwrap();
-        assert!(!meta.doc_id.is_empty(), "doc_id should not be empty");
+        let rid = meta.remote_id.clone().unwrap();
+        assert!(!rid.is_empty(), "remote_id should not be empty");
         assert!(!meta.url.is_empty(), "url should not be empty");
         // Cleanup
-        let _ = p.delete(&meta.doc_id).await;
+        let _ = p.delete(&rid).await;
     }
 
     // #2: CREATE FAIL — invalid CLI path → launch error
@@ -1007,15 +1036,16 @@ mod tests {
         let title = test_title("pull_s1");
         let md = format!("# {title}\n\nPull S1 test content.");
         let meta = p.create(&title, &md).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
 
         // Wait briefly for Feishu to index
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-        let fetched = p.read(&meta.doc_id).await.unwrap();
+        let fetched = p.read(&rid).await.unwrap();
         // Feishu may reformat markdown, so just check it's non-empty and contains title
         assert!(!fetched.content.is_empty(), "Fetched content should not be empty");
 
-        let _ = p.delete(&meta.doc_id).await;
+        let _ = p.delete(&rid).await;
     }
 
     // #11: PULL S2 — fetch always returns remote content, ignoring local changes
@@ -1026,17 +1056,18 @@ mod tests {
         let title = test_title("pull_s2");
         let md = format!("# {title}\n\nOriginal remote content.");
         let meta = p.create(&title, &md).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         // Simulate: local file modified to something else (we don't write file here,
         // just verify that read returns the remote version regardless)
-        let fetched = p.read(&meta.doc_id).await.unwrap();
+        let fetched = p.read(&rid).await.unwrap();
         assert!(!fetched.content.is_empty(), "Remote content should be returned");
         // read always returns remote content — this IS the "overwrite local" behavior
         // The caller (commands.rs) writes this to the local file, overwriting local changes.
 
-        let _ = p.delete(&meta.doc_id).await;
+        let _ = p.delete(&rid).await;
     }
 
     // #12: PULL S3 — remote has newer content [needs remote_hash]
@@ -1047,9 +1078,10 @@ mod tests {
         let p = live_provider();
         let title = test_title("pull_s3");
         let meta = p.create(&title, "# S3 test").await.unwrap();
-        let fetched = p.read(&meta.doc_id).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
+        let fetched = p.read(&rid).await.unwrap();
         assert!(fetched.content.is_empty() || !fetched.content.is_empty(), "Just verify call succeeds");
-        let _ = p.delete(&meta.doc_id).await;
+        let _ = p.delete(&rid).await;
     }
 
     // #13: PULL S4 — both sides modified [needs remote_hash]
@@ -1059,9 +1091,10 @@ mod tests {
         let p = live_provider();
         let title = test_title("pull_s4");
         let meta = p.create(&title, "# S4 test").await.unwrap();
-        let fetched = p.read(&meta.doc_id).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
+        let fetched = p.read(&rid).await.unwrap();
         assert!(fetched.content.is_empty() || !fetched.content.is_empty(), "Just verify call succeeds");
-        let _ = p.delete(&meta.doc_id).await;
+        let _ = p.delete(&rid).await;
     }
 
     // #14: PULL S5 — fetch a nonexistent doc → error
@@ -1082,11 +1115,12 @@ mod tests {
         let title = test_title("pull_s6_import");
         let md = format!("# {title}\n\nImport test.");
         let meta = p.create(&title, &md).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         // Simulate import: fetch → write to local file
-        let output = p.read(&meta.doc_id).await.unwrap();
+        let output = p.read(&rid).await.unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let local_path = tmp.path().join(format!("{title}.md"));
         std::fs::write(&local_path, &output.content).unwrap();
@@ -1095,7 +1129,7 @@ mod tests {
         let read_back = std::fs::read_to_string(&local_path).unwrap();
         assert_eq!(read_back, output.content, "Local file content should match fetched content");
 
-        let _ = p.delete(&meta.doc_id).await;
+        let _ = p.delete(&rid).await;
     }
 
     // #16: DELETE S1 — delete a synced doc
@@ -1105,13 +1139,14 @@ mod tests {
         let p = live_provider();
         let title = test_title("del_s1");
         let meta = p.create(&title, "# Delete S1").await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
 
-        p.delete(&meta.doc_id).await.unwrap();
+        p.delete(&rid).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         // Verify: fetch should fail
-        let result = p.read(&meta.doc_id).await;
+        let result = p.read(&rid).await;
         assert!(result.is_err(), "Fetch after delete should fail");
     }
 
@@ -1122,12 +1157,13 @@ mod tests {
         let p = live_provider();
         let title = test_title("del_s2");
         let meta = p.create(&title, "# Delete S2 original").await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
 
         // Update remote (simulates having local changes pushed)
-        p.write(&meta.doc_id, "# Delete S2 modified").await.unwrap();
+        p.write(&rid, "# Delete S2 modified").await.unwrap();
 
         // Delete should still succeed
-        p.delete(&meta.doc_id).await.unwrap();
+        p.delete(&rid).await.unwrap();
     }
 
     // #18: DELETE S3 [needs remote_hash]
@@ -1137,7 +1173,8 @@ mod tests {
         let p = live_provider();
         let title = test_title("del_s3");
         let meta = p.create(&title, "# Delete S3").await.unwrap();
-        p.delete(&meta.doc_id).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
+        p.delete(&rid).await.unwrap();
     }
 
     // #19: DELETE S4 [needs remote_hash]
@@ -1147,7 +1184,8 @@ mod tests {
         let p = live_provider();
         let title = test_title("del_s4");
         let meta = p.create(&title, "# Delete S4").await.unwrap();
-        p.delete(&meta.doc_id).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
+        p.delete(&rid).await.unwrap();
     }
 
     // #20: DELETE S5 — delete already-deleted doc → not_found
@@ -1157,12 +1195,13 @@ mod tests {
         let p = live_provider();
         let title = test_title("del_s5");
         let meta = p.create(&title, "# Delete S5").await.unwrap();
-        p.delete(&meta.doc_id).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
+        p.delete(&rid).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         // Second delete should fail
-        let result = p.delete(&meta.doc_id).await;
+        let result = p.delete(&rid).await;
         assert!(result.is_err(), "Deleting already-deleted doc should fail");
         // Verify the error is classified properly (not_found or similar)
         let err = result.unwrap_err();
@@ -1239,19 +1278,20 @@ mod tests {
         let title = test_title("write_ok");
         let md = format!("# {title}\n\nOriginal.");
         let meta = p.create(&title, &md).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let new_content = format!("# {title}\n\nUpdated by write test.");
-        let wm = p.write(&meta.doc_id, &new_content).await.unwrap();
+        let wm = p.write(&rid, &new_content).await.unwrap();
         assert!(!wm.updated_at.is_empty(), "WriteMeta should have updated_at");
 
         // Verify content was actually written
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let fetched = p.read(&meta.doc_id).await.unwrap();
+        let fetched = p.read(&rid).await.unwrap();
         assert!(fetched.content.contains("Updated by write test"), "Content should be updated, got: {}", fetched.content);
 
-        let _ = p.delete(&meta.doc_id).await;
+        let _ = p.delete(&rid).await;
     }
 
     // #27: WRITE FAIL — write to nonexistent doc
@@ -1273,22 +1313,23 @@ mod tests {
         let title = test_title("rename_ok");
         let md = format!("# {title}\n\nRename test.");
         let meta = p.create(&title, &md).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let new_title = test_title("renamed");
-        p.rename(&meta.doc_id, &new_title).await.unwrap();
+        p.rename(&rid, &new_title).await.unwrap();
 
         // Verify rename took effect by reading back
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let fetched = p.read(&meta.doc_id).await.unwrap();
+        let fetched = p.read(&rid).await.unwrap();
         // The content should now have the new title
         assert!(
             fetched.content.contains(&new_title) || fetched.meta.title.contains("renamed"),
             "Title should be updated after rename"
         );
 
-        let _ = p.delete(&meta.doc_id).await;
+        let _ = p.delete(&rid).await;
     }
 
     // #29: RENAME FAIL — rename nonexistent doc
@@ -1308,14 +1349,15 @@ mod tests {
         let title = test_title("rename_special");
         let md = format!("# {title}\n\nSpecial char rename test.");
         let meta = p.create(&title, &md).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let new_title = format!("_Test_重命名_中文标题_{}", chrono::Local::now().format("%H%M%S"));
-        let result = p.rename(&meta.doc_id, &new_title).await;
+        let result = p.rename(&rid, &new_title).await;
         assert!(result.is_ok(), "Rename with Chinese characters should succeed");
 
-        let _ = p.delete(&meta.doc_id).await;
+        let _ = p.delete(&rid).await;
     }
 
     // ─── LIST direct tests ─────────────────────────────────

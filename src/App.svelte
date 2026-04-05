@@ -375,12 +375,13 @@
 
     // Listen for sync status updates from backend
     listen<SyncStatusUpdate>("sync-status", (event) => {
-      const { doc_id, status, title, new_doc_id } = event.payload;
+      const { note_id, status, title, new_remote_id } = event.payload;
       docs = docs.map((d) => {
-        if (d.doc_id === doc_id) {
+        if (d.note_id === note_id || d.doc_id === note_id) {
           return {
             ...d,
-            doc_id: new_doc_id ?? d.doc_id,
+            doc_id: new_remote_id ?? d.doc_id,
+            remote_id: new_remote_id ?? d.remote_id,
             sync_status: status,
             title: title ?? d.title,
           };
@@ -388,9 +389,9 @@
         return d;
       });
       if (status.type === "Synced") {
-        addToast(`「${title ?? doc_id}」同步完成`, "success");
+        addToast(`「${title ?? note_id}」同步完成`, "success");
       } else if (status.type === "Conflict") {
-        addToast(`「${title ?? doc_id}」同步冲突`, "error");
+        addToast(`「${title ?? note_id}」同步冲突`, "error");
       }
     });
 

@@ -480,6 +480,8 @@ mod tests {
         content_hash: Option<&str>,
     ) {
         let meta = DocMeta {
+            note_id: doc_id.to_string(),
+            remote_id: Some(doc_id.to_string()),
             doc_id: doc_id.to_string(),
             title: title.to_string(),
             doc_type: "DOCX".to_string(),
@@ -493,6 +495,10 @@ mod tests {
             folder_path: String::new(),
         file_size: None,
         word_count: None,
+            sync_state: SyncState::Synced,
+            title_mode: "manual".to_string(),
+            desired_title: None,
+            desired_path: None,
         };
         storage.lock().unwrap().upsert_doc(&meta).unwrap();
     }

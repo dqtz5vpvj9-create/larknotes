@@ -1,5 +1,7 @@
 export interface DocMeta {
-  doc_id: string;
+  note_id: string;
+  remote_id: string | null;
+  doc_id: string; // backward compat: remote_id ?? note_id
   title: string;
   doc_type: string;
   url: string;
@@ -9,9 +11,13 @@ export interface DocMeta {
   local_path: string | null;
   content_hash: string | null;
   sync_status: SyncStatus;
+  sync_state: SyncState;
   folder_path: string;
   file_size: number | null;
   word_count: number | null;
+  title_mode: string;
+  desired_title: string | null;
+  desired_path: string | null;
 }
 
 export interface FolderTreeNode {
@@ -32,6 +38,19 @@ export type SyncStatus =
   | { type: "Error"; message: string }
   | { type: "New" };
 
+export type SyncState =
+  | "Synced"
+  | "LocalModified"
+  | "RemoteModified"
+  | "BothModified"
+  | "Executing"
+  | "Conflict"
+  | "PendingCreate"
+  | "PendingDelete"
+  | "PendingRename"
+  | { Error: string }
+  | "FileMissing";
+
 export interface AuthStatus {
   logged_in: boolean;
   user_name: string | null;
@@ -48,10 +67,12 @@ export interface AppConfig {
 }
 
 export interface SyncStatusUpdate {
-  doc_id: string;
+  note_id: string;
   status: SyncStatus;
   title: string | null;
-  new_doc_id?: string;
+  new_remote_id?: string;
+  /** @deprecated Use note_id instead */
+  doc_id?: string;
 }
 
 export interface SyncHistoryEntry {

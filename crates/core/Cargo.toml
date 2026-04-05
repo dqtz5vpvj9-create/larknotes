@@ -11,3 +11,4 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 dirs = { workspace = true }
 unicode-segmentation = { workspace = true }
+uuid = { workspace = true }

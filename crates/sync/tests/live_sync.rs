@@ -4,7 +4,8 @@
 use larknotes_core::*;
 use larknotes_provider_cli::CliProvider;
 use larknotes_storage::Storage;
-use larknotes_sync::{hash_content, SyncEngine};
+use larknotes_sync::{hash_content};
+use larknotes_sync::engine::SyncEngine;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
@@ -48,6 +49,8 @@ async fn create_synced_doc(
         None
     };
     let db_meta = DocMeta {
+        note_id: doc_id.clone(),
+        remote_id: Some(doc_id.clone()),
         doc_id: doc_id.clone(),
         title: title.to_string(),
         doc_type: "DOCX".to_string(),
@@ -61,6 +64,10 @@ async fn create_synced_doc(
         folder_path: String::new(),
         file_size: None,
         word_count: None,
+        sync_state: SyncState::Synced,
+        title_mode: "manual".to_string(),
+        desired_title: None,
+        desired_path: None,
     };
     storage.lock().unwrap().upsert_doc(&db_meta).unwrap();
 
@@ -305,6 +312,8 @@ async fn test_live_push_s5_recreate_fail() {
     let file_path = titled_content_path(tmp.path(), &title);
     std::fs::write(&file_path, content).unwrap();
     let meta = DocMeta {
+        note_id: "nonexistent_doc_999".to_string(),
+        remote_id: Some("nonexistent_doc_999".to_string()),
         doc_id: "nonexistent_doc_999".to_string(),
         title: title.clone(),
         doc_type: "DOCX".to_string(),
@@ -318,6 +327,10 @@ async fn test_live_push_s5_recreate_fail() {
         folder_path: String::new(),
         file_size: None,
         word_count: None,
+        sync_state: SyncState::Synced,
+        title_mode: "manual".to_string(),
+        desired_title: None,
+        desired_path: None,
     };
     storage.lock().unwrap().upsert_doc(&meta).unwrap();
 
