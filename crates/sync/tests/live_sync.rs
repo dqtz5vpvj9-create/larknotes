@@ -25,7 +25,7 @@ fn setup_workspace() -> (tempfile::TempDir, Arc<Mutex<Storage>>) {
 }
 
 /// Create a remote doc via CliProvider and set up local file + DB entry.
-/// Returns (doc_id, local_file_path).
+/// Returns (note_id, remote_id, local_file_path).
 async fn create_synced_doc(
     provider: &CliProvider,
     workspace: &std::path::Path,
@@ -33,10 +33,11 @@ async fn create_synced_doc(
     title: &str,
     content: &str,
     store_matching_hash: bool,
-) -> (String, std::path::PathBuf) {
+) -> (String, String, std::path::PathBuf) {
     // Create on remote
     let meta = provider.create(title, content).await.unwrap();
-    let doc_id = meta.doc_id.clone();
+    let remote_id = meta.remote_id.clone().unwrap_or_default();
+    let note_id = new_note_id();
 
     // Write local file
     let file_path = titled_content_path(workspace, title);
@@ -49,9 +50,9 @@ async fn create_synced_doc(
         None
     };
     let db_meta = DocMeta {
-        note_id: doc_id.clone(),
-        remote_id: Some(doc_id.clone()),
-        doc_id: doc_id.clone(),
+        note_id: note_id.clone(),
+        remote_id: Some(remote_id.clone()),
+        doc_id: remote_id.clone(),
         title: title.to_string(),
         doc_type: "DOCX".to_string(),
         url: meta.url.clone(),
@@ -71,7 +72,7 @@ async fn create_synced_doc(
     };
     storage.lock().unwrap().upsert_doc(&db_meta).unwrap();
 
-    (doc_id, file_path)
+    (note_id, remote_id, file_path)
 }
 
 // #3: PUSH S1 skip — hash matches, force=false → no remote update
@@ -83,31 +84,31 @@ async fn test_live_push_s1_skip() {
     let title = test_title("push_s1_skip");
     let content = format!("# {title}\n\nS1 skip test.");
 
-    let (doc_id, _path) = create_synced_doc(
+    let (note_id, remote_id, _path) = create_synced_doc(
         &provider, tmp.path(), &storage, &title, &content, true,
     ).await;
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Fetch remote content before sync
-    let before = provider.read(&doc_id).await.unwrap().content;
+    let before = provider.read(&remote_id).await.unwrap().content;
 
     let (engine, _rx) = SyncEngine::new(
         provider.clone(), storage.clone(), tmp.path().to_path_buf(),
         Arc::new(AtomicU64::new(2000)),
     );
     let engine = Arc::new(engine);
-    engine.sync_one(&doc_id, false).await;
+    engine.sync_one(&note_id, false).await;
 
     // Fetch remote content after sync — should be unchanged
-    let after = provider.read(&doc_id).await.unwrap().content;
+    let after = provider.read(&remote_id).await.unwrap().content;
     assert_eq!(before, after, "Remote content should not change when hash matches");
 
     // DB status should still be Synced
-    let doc = storage.lock().unwrap().get_doc(&doc_id).unwrap().unwrap();
+    let doc = storage.lock().unwrap().get_doc(&note_id).unwrap().unwrap();
     assert_eq!(doc.sync_status, SyncStatus::Synced);
 
-    let _ = provider.delete(&doc_id).await;
+    let _ = provider.delete(&remote_id).await;
 }
 
 // #4: PUSH S1 force — hash matches but force=true → still pushes
@@ -119,7 +120,7 @@ async fn test_live_push_s1_force() {
     let title = test_title("push_s1_force");
     let content = format!("# {title}\n\nS1 force test.");
 
-    let (doc_id, _path) = create_synced_doc(
+    let (note_id, remote_id, _path) = create_synced_doc(
         &provider, tmp.path(), &storage, &title, &content, true,
     ).await;
 
@@ -129,14 +130,14 @@ async fn test_live_push_s1_force() {
     );
     let engine = Arc::new(engine);
     // force=true should push even though hash matches
-    engine.sync_one(&doc_id, true).await;
+    engine.sync_one(&note_id, true).await;
 
     // DB status should be Synced (push succeeded)
-    let doc = storage.lock().unwrap().get_doc(&doc_id).unwrap().unwrap();
+    let doc = storage.lock().unwrap().get_doc(&note_id).unwrap().unwrap();
     assert_eq!(doc.sync_status, SyncStatus::Synced);
     assert!(doc.content_hash.is_some(), "Hash should be updated after force push");
 
-    let _ = provider.delete(&doc_id).await;
+    let _ = provider.delete(&remote_id).await;
 }
 
 // #5: PUSH S2 — local content differs from stored hash → pushes new content
@@ -150,7 +151,7 @@ async fn test_live_push_s2_ok() {
     let modified = format!("# {title}\n\nModified locally — push S2 test.");
 
     // Create remote with original content, store original hash
-    let (doc_id, path) = create_synced_doc(
+    let (note_id, remote_id, path) = create_synced_doc(
         &provider, tmp.path(), &storage, &title, &original, true,
     ).await;
 
@@ -164,20 +165,20 @@ async fn test_live_push_s2_ok() {
         Arc::new(AtomicU64::new(2000)),
     );
     let engine = Arc::new(engine);
-    engine.sync_one(&doc_id, false).await;
+    engine.sync_one(&note_id, false).await;
 
     // Verify remote content was updated
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let fetched = provider.read(&doc_id).await.unwrap().content;
+    let fetched = provider.read(&remote_id).await.unwrap().content;
     assert!(
         fetched.contains("Modified locally"),
         "Remote should have new content, got: {fetched}"
     );
 
-    let doc = storage.lock().unwrap().get_doc(&doc_id).unwrap().unwrap();
+    let doc = storage.lock().unwrap().get_doc(&note_id).unwrap().unwrap();
     assert_eq!(doc.sync_status, SyncStatus::Synced);
 
-    let _ = provider.delete(&doc_id).await;
+    let _ = provider.delete(&remote_id).await;
 }
 
 // #6: PUSH S3 — remote has newer content [needs remote_hash]
@@ -205,12 +206,12 @@ async fn test_live_push_s5_recreate() {
     let title = test_title("push_s5_recreate");
     let content = format!("# {title}\n\nRecreate test.");
 
-    let (doc_id, _path) = create_synced_doc(
+    let (note_id, remote_id, _path) = create_synced_doc(
         &provider, tmp.path(), &storage, &title, &content, false,
     ).await;
 
     // Delete remote doc
-    provider.delete(&doc_id).await.unwrap();
+    provider.delete(&remote_id).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let (engine, _rx) = SyncEngine::new(
@@ -218,24 +219,20 @@ async fn test_live_push_s5_recreate() {
         Arc::new(AtomicU64::new(2000)),
     );
     let engine = Arc::new(engine);
-    engine.sync_one(&doc_id, true).await;
+    engine.sync_one(&note_id, true).await;
 
-    // Old doc_id should be replaced with new one in DB
-    let _old_doc = storage.lock().unwrap().get_doc(&doc_id).unwrap();
-    // The old doc_id should no longer exist (replaced by new one)
-    // Check all docs for the new one
-    let all_docs = storage.lock().unwrap().list_docs().unwrap();
-    assert_eq!(all_docs.len(), 1, "Should have exactly one doc after recreate");
-    let new_doc = &all_docs[0];
-    assert_ne!(new_doc.doc_id, doc_id, "Doc ID should have changed after recreate");
-    assert_eq!(new_doc.sync_status, SyncStatus::Synced, "Status should be Synced after recreate");
+    // note_id stays the same, remote_id should have changed
+    let doc = storage.lock().unwrap().get_doc(&note_id).unwrap().unwrap();
+    assert_eq!(doc.sync_status, SyncStatus::Synced, "Status should be Synced after recreate");
+    let new_remote_id = doc.remote_id.clone().unwrap_or_default();
+    assert_ne!(new_remote_id, remote_id, "remote_id should have changed after recreate");
 
     // Verify new doc exists on remote
-    let fetched = provider.read(&new_doc.doc_id).await.unwrap().content;
+    let fetched = provider.read(&new_remote_id).await.unwrap().content;
     assert!(!fetched.is_empty(), "New remote doc should have content");
 
     // Cleanup
-    let _ = provider.delete(&new_doc.doc_id).await;
+    let _ = provider.delete(&new_remote_id).await;
 }
 
 // #9a: PUSH with title change — sync_one calls write + rename
@@ -247,7 +244,7 @@ async fn test_live_push_with_rename() {
     let original_title = test_title("push_rename");
     let content = format!("# {original_title}\n\nOriginal content.");
 
-    let (doc_id, path) = create_synced_doc(
+    let (note_id, remote_id, path) = create_synced_doc(
         &provider, tmp.path(), &storage, &original_title, &content, true,
     ).await;
 
@@ -263,21 +260,21 @@ async fn test_live_push_with_rename() {
         Arc::new(AtomicU64::new(2000)),
     );
     let engine = Arc::new(engine);
-    engine.sync_one(&doc_id, false).await;
+    engine.sync_one(&note_id, false).await;
 
     // Verify remote content was updated
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    let fetched = provider.read(&doc_id).await.unwrap();
+    let fetched = provider.read(&remote_id).await.unwrap();
     assert!(
         fetched.content.contains("Content with new title"),
         "Remote content should be updated, got: {}", fetched.content
     );
 
     // DB should be synced
-    let doc = storage.lock().unwrap().get_doc(&doc_id).unwrap().unwrap();
+    let doc = storage.lock().unwrap().get_doc(&note_id).unwrap().unwrap();
     assert_eq!(doc.sync_status, SyncStatus::Synced);
 
-    let _ = provider.delete(&doc_id).await;
+    let _ = provider.delete(&remote_id).await;
 }
 
 // #9b: LIST via engine — verify list returns docs from Lark
@@ -295,7 +292,7 @@ async fn test_live_list_through_provider() {
     let docs = provider.list(None).await.unwrap();
     assert!(!docs.is_empty(), "List should return at least the doc we created");
 
-    let _ = provider.delete(&meta.doc_id).await;
+    let _ = provider.delete(&meta.remote_id.unwrap_or_default()).await;
 }
 
 // #9: PUSH S5 recreate fail — both update and create fail

@@ -339,7 +339,7 @@ impl SyncEngine {
     /// The two hash spaces are never compared across the format boundary.
     pub async fn sync_one(&self, doc_id: &str, force: bool) {
         // ── 1. Read DB state + local file ───────────────────────
-        let (content_path, content_hash, remote_hash_cached, old_title) = match self.storage.lock() {
+        let (content_path, content_hash, remote_hash_cached, old_title, remote_id) = match self.storage.lock() {
             Ok(store) => {
                 let doc = store.get_doc(doc_id).ok().flatten();
                 let local_path = doc.as_ref()
@@ -348,6 +348,7 @@ impl SyncEngine {
                 let base = doc.as_ref().and_then(|d| d.content_hash.clone());
                 let remote = store.get_remote_hash(doc_id).ok().flatten();
                 let title = doc.as_ref().map(|d| d.title.clone());
+                let rid = doc.as_ref().and_then(|d| d.remote_id.clone());
                 let path = match local_path {
                     Some(p) if p.exists() => p,
                     _ => {
@@ -355,10 +356,28 @@ impl SyncEngine {
                         titled_content_path(&self.workspace_dir, &t)
                     }
                 };
-                (path, base, remote, title)
+                (path, base, remote, title, rid)
             }
             Err(e) => {
                 tracing::error!("Storage lock poisoned: {e}");
+                return;
+            }
+        };
+
+        // remote_id is required for provider calls (read/write/rename)
+        let remote_id = match remote_id {
+            Some(rid) if !rid.is_empty() => rid,
+            _ => {
+                // No remote_id — treat as new file
+                let raw = match tokio::fs::read(&content_path).await {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let content = decode_content(&raw);
+                let local_hash = hash_content(content.as_bytes());
+                let title = extract_title(&content);
+                self.emit_status(doc_id, SyncStatus::Syncing, None);
+                self.recreate_on_remote(doc_id, &title, &content, &local_hash).await;
                 return;
             }
         };
@@ -382,7 +401,7 @@ impl SyncEngine {
         let (remote_changed, remote_content) = if !local_changed && !force {
             (false, None)
         } else {
-            match self.provider.read(doc_id).await {
+            match self.provider.read(&remote_id).await {
                 Ok(read_output) => {
                     let fresh_remote_hash = hash_content(read_output.content.as_bytes());
                     // Cache fresh remote hash (in remote format space)
@@ -439,7 +458,7 @@ impl SyncEngine {
             SyncDecision::NewFile => {
                 let title = extract_title(&content);
                 self.emit_status(doc_id, SyncStatus::Syncing, None);
-                self.push_to_remote(doc_id, &content, &local_hash, &title, old_title.as_deref()).await;
+                self.push_to_remote(doc_id, &remote_id, &content, &local_hash, &title, old_title.as_deref()).await;
             }
             SyncDecision::PushLocal => {
                 let title = extract_title(&content);
@@ -447,13 +466,13 @@ impl SyncEngine {
                 if let Ok(store) = self.storage.lock() {
                     let _ = store.update_sync_status(doc_id, &SyncStatus::Syncing);
                 }
-                self.push_to_remote(doc_id, &content, &local_hash, &title, old_title.as_deref()).await;
+                self.push_to_remote(doc_id, &remote_id, &content, &local_hash, &title, old_title.as_deref()).await;
             }
         }
     }
 
     /// Push local content to remote with retry logic.
-    async fn push_to_remote(&self, doc_id: &str, content: &str, local_hash: &str, title: &str, old_title: Option<&str>) {
+    async fn push_to_remote(&self, doc_id: &str, remote_id: &str, content: &str, local_hash: &str, title: &str, old_title: Option<&str>) {
         let title_changed = old_title.map_or(false, |old| old != title);
 
         let retry_delays = [
@@ -463,11 +482,11 @@ impl SyncEngine {
         ];
 
         // First attempt
-        match self.provider.write(doc_id, content).await {
+        match self.provider.write(remote_id, content).await {
             Ok(write_meta) => {
                 tracing::debug!("write 成功: {doc_id}, remote_at={}", write_meta.updated_at);
                 if title_changed {
-                    if let Err(e) = self.provider.rename(doc_id, title).await {
+                    if let Err(e) = self.provider.rename(remote_id, title).await {
                         tracing::error!("重命名失败 (内容已推送): {doc_id}: {e}");
                         if let Ok(store) = self.storage.lock() {
                             let _ = store.set_synced_hashes(doc_id, local_hash);
@@ -515,11 +534,11 @@ impl SyncEngine {
 
             tokio::time::sleep(*delay).await;
 
-            match self.provider.write(doc_id, content).await {
+            match self.provider.write(remote_id, content).await {
                 Ok(write_meta) => {
                     tracing::debug!("重试 write 成功: {doc_id}, remote_at={}", write_meta.updated_at);
                     if title_changed {
-                        if let Err(e) = self.provider.rename(doc_id, title).await {
+                        if let Err(e) = self.provider.rename(remote_id, title).await {
                             tracing::error!("重试后重命名失败: {doc_id}: {e}");
                             if let Ok(store) = self.storage.lock() {
                                 let _ = store.set_synced_hashes(doc_id, local_hash);
@@ -653,6 +672,12 @@ impl SyncEngine {
                 _ => {}
             }
 
+            // Resolve remote_id — skip docs without one
+            let remote_id = match &doc.remote_id {
+                Some(rid) if !rid.is_empty() => rid.as_str(),
+                _ => continue,
+            };
+
             let _permit = match self.semaphore.acquire().await {
                 Ok(p) => p,
                 Err(_) => return,
@@ -661,12 +686,12 @@ impl SyncEngine {
             // Get cached remote_hash from DB
             let cached_remote_hash = self.storage.lock()
                 .ok()
-                .and_then(|s| s.get_remote_hash(&doc.doc_id).ok().flatten());
+                .and_then(|s| s.get_remote_hash(&doc.note_id).ok().flatten());
 
-            let read_output = match self.provider.read(&doc.doc_id).await {
+            let read_output = match self.provider.read(remote_id).await {
                 Ok(o) => o,
                 Err(e) => {
-                    tracing::debug!("远端轮询: 读取 {} 失败: {e}", doc.doc_id);
+                    tracing::debug!("远端轮询: 读取 {} 失败: {e}", doc.note_id);
                     continue;
                 }
             };
@@ -676,9 +701,9 @@ impl SyncEngine {
             // If no cached remote_hash, this is the first poll for this doc.
             // Just establish the baseline — do NOT pull.
             if cached_remote_hash.is_none() {
-                tracing::debug!("远端轮询: 建立基线 {} (首次检查)", doc.doc_id);
+                tracing::debug!("远端轮询: 建立基线 {} (首次检查)", doc.note_id);
                 if let Ok(store) = self.storage.lock() {
-                    let _ = store.update_remote_hash(&doc.doc_id, &fresh_remote_hash);
+                    let _ = store.update_remote_hash(&doc.note_id, &fresh_remote_hash);
                 }
                 continue;
             }
@@ -692,7 +717,7 @@ impl SyncEngine {
 
             // Remote changed since last check! Update cache.
             if let Ok(store) = self.storage.lock() {
-                let _ = store.update_remote_hash(&doc.doc_id, &fresh_remote_hash);
+                let _ = store.update_remote_hash(&doc.note_id, &fresh_remote_hash);
             }
 
             // Read local to determine if it also changed.
@@ -716,15 +741,15 @@ impl SyncEngine {
 
             match decision {
                 SyncDecision::PullRemote => {
-                    tracing::info!("远端轮询: 自动拉取 {}", doc.doc_id);
-                    self.pull_to_local(&doc.doc_id, &read_output.content).await;
+                    tracing::info!("远端轮询: 自动拉取 {}", doc.note_id);
+                    self.pull_to_local(&doc.note_id, &read_output.content).await;
                 }
                 SyncDecision::BothModified => {
-                    tracing::warn!("远端轮询: 双端冲突 {}", doc.doc_id);
+                    tracing::warn!("远端轮询: 双端冲突 {}", doc.note_id);
                     if let Ok(store) = self.storage.lock() {
-                        let _ = store.update_sync_status(&doc.doc_id, &SyncStatus::BothModified);
+                        let _ = store.update_sync_status(&doc.note_id, &SyncStatus::BothModified);
                     }
-                    self.emit_status(&doc.doc_id, SyncStatus::BothModified, None);
+                    self.emit_status(&doc.note_id, SyncStatus::BothModified, None);
                 }
                 _ => {}
             }
@@ -734,40 +759,37 @@ impl SyncEngine {
     }
 
     /// Re-create a document on the remote when the original was deleted server-side.
-    /// Creates a new remote doc, updates the local doc_id to match.
-    async fn recreate_on_remote(&self, old_doc_id: &str, title: &str, content: &str, new_hash: &str) {
+    /// Creates a new remote doc, updates remote_id on the existing DB entry.
+    async fn recreate_on_remote(&self, doc_id: &str, title: &str, content: &str, new_hash: &str) {
         match self.provider.create(title, content).await {
             Ok(new_meta) => {
-                let new_id = &new_meta.doc_id;
-                tracing::info!("远端重建成功: {old_doc_id} → {new_id}");
+                let new_remote_id = new_meta.remote_id.as_deref().unwrap_or("");
+                tracing::info!("远端重建成功: {doc_id} → remote_id={new_remote_id}");
                 if let Ok(store) = self.storage.lock() {
-                    // replace_doc_id is transactional — if it fails, the old doc_id remains intact.
-                    if let Err(e) = store.replace_doc_id(old_doc_id, new_id) {
-                        tracing::error!("重建后替换doc_id失败: {e}");
-                        let _ = store.update_sync_status(old_doc_id, &SyncStatus::Error(format!("DB更新失败: {e}")));
-                        self.emit_status(old_doc_id, SyncStatus::Error(format!("DB更新失败: {e}")), None);
+                    if let Err(e) = store.update_remote_id(doc_id, new_remote_id) {
+                        tracing::error!("重建后更新remote_id失败: {e}");
+                        let _ = store.update_sync_status(doc_id, &SyncStatus::Error(format!("DB更新失败: {e}")));
+                        self.emit_status(doc_id, SyncStatus::Error(format!("DB更新失败: {e}")), None);
                         return;
                     }
-                    if let Err(e) = store.update_content_hash(new_id, new_hash) {
+                    if let Err(e) = store.update_content_hash(doc_id, new_hash) {
                         tracing::error!("重建后更新hash失败: {e}");
                     }
-                    let _ = store.update_sync_status(new_id, &SyncStatus::Synced);
-                    let _ = store.add_sync_history(new_id, "recreate", Some(new_hash));
-                    let _ = store.save_snapshot(new_id, content, new_hash);
+                    let _ = store.update_sync_status(doc_id, &SyncStatus::Synced);
+                    let _ = store.add_sync_history(doc_id, "recreate", Some(new_hash));
+                    let _ = store.save_snapshot(doc_id, content, new_hash);
                     if !new_meta.url.is_empty() {
-                        let _ = store.update_url(new_id, &new_meta.url);
+                        let _ = store.update_url(doc_id, &new_meta.url);
                     }
                 }
-                // Emit with OLD doc_id so frontend (which still has old_doc_id in its list)
-                // can match and update. Include new_doc_id so frontend replaces it.
-                self.emit_status_with_new_id(old_doc_id, new_id, SyncStatus::Synced, Some(title.to_string()));
+                self.emit_status(doc_id, SyncStatus::Synced, Some(title.to_string()));
             }
             Err(e) => {
-                tracing::error!("远端重建失败: {old_doc_id}: {e}");
+                tracing::error!("远端重建失败: {doc_id}: {e}");
                 if let Ok(store) = self.storage.lock() {
-                    let _ = store.update_sync_status(old_doc_id, &SyncStatus::Error(format!("重建失败: {e}")));
+                    let _ = store.update_sync_status(doc_id, &SyncStatus::Error(format!("重建失败: {e}")));
                 }
-                self.emit_status(old_doc_id, SyncStatus::Error(format!("重建失败: {e}")), None);
+                self.emit_status(doc_id, SyncStatus::Error(format!("重建失败: {e}")), None);
             }
         }
     }
@@ -840,20 +862,21 @@ impl SyncEngine {
         // No orphan match — create new remote doc
         match self.provider.create(&title, &content).await {
             Ok(created) => {
-                let doc_id = created.doc_id.clone();
+                let remote_id = created.remote_id.clone().unwrap_or_default();
+                let note_id = new_note_id();
                 // Ensure unique title within folder
                 let unique_title = self.storage.lock()
                     .ok()
-                    .and_then(|s| s.unique_title(&title, &folder, Some(&doc_id)).ok())
+                    .and_then(|s| s.unique_title(&title, &folder, Some(&note_id)).ok())
                     .unwrap_or_else(|| title.clone());
                 if unique_title != title {
                     tracing::info!("adopt_new_file: 标题去重 '{title}' → '{unique_title}'");
-                    let _ = self.provider.rename(&doc_id, &unique_title).await;
+                    let _ = self.provider.rename(&remote_id, &unique_title).await;
                 }
                 let meta = DocMeta {
-                    note_id: created.note_id.clone(),
-                    remote_id: created.remote_id.clone(),
-                    doc_id: doc_id.clone(),
+                    note_id: note_id.clone(),
+                    remote_id: Some(remote_id.clone()),
+                    doc_id: remote_id.clone(),
                     title: unique_title.clone(),
                     doc_type: created.doc_type.clone(),
                     url: created.url.clone(),
@@ -873,11 +896,11 @@ impl SyncEngine {
                 };
                 if let Ok(store) = self.storage.lock() {
                     let _ = store.upsert_doc(&meta);
-                    let _ = store.add_sync_history(&doc_id, "adopt_new_file", Some(&hash));
-                    let _ = store.save_snapshot(&doc_id, &content, &hash);
+                    let _ = store.add_sync_history(&note_id, "adopt_new_file", Some(&hash));
+                    let _ = store.save_snapshot(&note_id, &content, &hash);
                 }
-                self.emit_status(&doc_id, SyncStatus::Synced, Some(unique_title.clone()));
-                tracing::info!("adopt_new_file: created remote doc for '{unique_title}' → {doc_id}");
+                self.emit_status(&note_id, SyncStatus::Synced, Some(unique_title.clone()));
+                tracing::info!("adopt_new_file: created remote doc for '{unique_title}' → {note_id} (remote: {remote_id})");
             }
             Err(e) => {
                 tracing::warn!("adopt_new_file: failed to create remote doc for '{}': {e}", title);
@@ -894,14 +917,6 @@ impl SyncEngine {
         });
     }
 
-    fn emit_status_with_new_id(&self, old_doc_id: &str, new_doc_id: &str, status: SyncStatus, title: Option<String>) {
-        let _ = self.status_tx.send(SyncStatusUpdate {
-            doc_id: old_doc_id.to_string(),
-            status,
-            title,
-            new_doc_id: Some(new_doc_id.to_string()),
-        });
-    }
 }
 
 #[cfg(test)]
@@ -1251,13 +1266,12 @@ mod tests {
         // Note: content_hash update uses new_id (remote_id) as note_id, which doesn't match.
         // This is a known issue in old engine code - the new scheduler/executor handles this correctly.
 
-        // Status emissions: Syncing, then Synced (with old doc_id + new_doc_id for frontend)
+        // Status emissions: Syncing, then Synced (note_id stays same)
         let update = status_rx.try_recv().unwrap();
         assert_eq!(update.status, SyncStatus::Syncing);
         let update = status_rx.try_recv().unwrap();
         assert_eq!(update.status, SyncStatus::Synced);
         assert_eq!(update.doc_id, "deleted_doc");
-        assert_eq!(update.new_doc_id.as_deref(), Some(new_id.as_str()));
     }
 
     #[tokio::test]
@@ -1847,14 +1861,14 @@ mod tests {
 
         let creates = provider.get_creates();
         assert_eq!(creates.len(), 1);
-        let new_id = &creates[0].0;
 
         let store = storage.lock().unwrap();
-        let history = store.get_sync_history(new_id, 10).unwrap();
+        // History/snapshots stored under note_id, not remote_id
+        let history = store.get_sync_history("hist_recreate", 10).unwrap();
         assert!(!history.is_empty(), "Should record recreate in history");
         assert_eq!(history[0].action, "recreate");
 
-        let snapshots = store.get_snapshots(new_id).unwrap();
+        let snapshots = store.get_snapshots("hist_recreate").unwrap();
         assert!(!snapshots.is_empty(), "Should save snapshot after recreate");
     }
 
