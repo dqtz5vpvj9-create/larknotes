@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 larknotes-core = { path = "../core" }
 tracing = { workspace = true }
-which = "7"
+which = "8"
 dirs = { workspace = true }
 tokio = { workspace = true }
 
