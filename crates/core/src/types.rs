@@ -81,7 +81,7 @@ pub struct WriteMeta {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "message")]
 pub enum SyncStatus {
     Synced,
@@ -92,13 +92,8 @@ pub enum SyncStatus {
     Pulling,
     Conflict,
     Error(String),
+    #[default]
     New,
-}
-
-impl Default for SyncStatus {
-    fn default() -> Self {
-        Self::New
-    }
 }
 
 fn default_title_mode() -> String {
@@ -106,8 +101,9 @@ fn default_title_mode() -> String {
 }
 
 /// New sync state machine (P4 architecture).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum SyncState {
+    #[default]
     Synced,
     LocalModified,
     RemoteModified,
@@ -119,12 +115,6 @@ pub enum SyncState {
     PendingRename,
     Error(String),
     FileMissing,
-}
-
-impl Default for SyncState {
-    fn default() -> Self {
-        Self::Synced
-    }
 }
 
 impl std::fmt::Display for SyncState {
