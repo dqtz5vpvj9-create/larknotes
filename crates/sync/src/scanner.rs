@@ -125,7 +125,7 @@ pub fn scan(workspace: &Path, storage: &Arc<Mutex<Storage>>) -> ScanResult {
 
             // Check worktree_snapshot for quick skip (mtime+size)
             let snap = snapshot_by_note.get(note.note_id.as_str());
-            let mtime_match = snap.map_or(false, |s| s.mtime_ns == *mtime && s.size == *size);
+            let mtime_match = snap.is_some_and(|s| s.mtime_ns == *mtime && s.size == *size);
 
             if mtime_match {
                 // File hasn't changed — just update scan_gen

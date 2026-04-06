@@ -112,7 +112,7 @@ pub fn plan(
 
         // Check if remote also changed
         let remote_obs = remote_by_note.get(note_id.as_str());
-        let remote_changed = remote_obs.map_or(false, |obs| {
+        let remote_changed = remote_obs.is_some_and(|obs| {
             // Compare remote observed hash against stored remote baseline.
             // Scheduler only includes observations where hash already differs
             // from stored remote_base_hash, so presence means "changed".

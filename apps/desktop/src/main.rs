@@ -385,7 +385,7 @@ fn main() {
                 } if label == "main" => {
                     let is_quitting = app
                         .try_state::<QuittingFlag>()
-                        .map_or(false, |f| f.0.load(Ordering::SeqCst));
+                        .is_some_and(|f| f.0.load(Ordering::SeqCst));
                     if !is_quitting {
                         // Prevent window destruction — hide to tray instead
                         api.prevent_close();

@@ -102,7 +102,7 @@ impl FileWatcher {
                                 Self::handle_modify_create(&event, &tx_clone, &write_guard_clone);
                             }
                         }
-                        _ => return,
+                        _ => (),
                     }
                 }
                 Err(e) => {

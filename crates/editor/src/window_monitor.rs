@@ -36,8 +36,8 @@ pub fn is_file_in_any_window(filename: &str) -> bool {
     // We use a thread-local to pass the filename into the callback since
     // EnumWindows only gives us an LPARAM (integer).  AtomicBool is simpler.
     thread_local! {
-        static FOUND: AtomicBool = AtomicBool::new(false);
-        static NEEDLE: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+        static FOUND: AtomicBool = const { AtomicBool::new(false) };
+        static NEEDLE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     }
 
     FOUND.with(|f| f.store(false, Ordering::SeqCst));
@@ -237,11 +237,17 @@ pub struct MockFileOpenChecker {
     open_files: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
-impl MockFileOpenChecker {
-    pub fn new() -> Self {
+impl Default for MockFileOpenChecker {
+    fn default() -> Self {
         Self {
             open_files: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
+    }
+}
+
+impl MockFileOpenChecker {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn mark_open(&self, filename: &str) {
@@ -421,7 +427,7 @@ mod tests {
 
         // Open in notepad (on modern Windows, notepad is a launcher too —
         // the spawned child may exit immediately, real notepad is a separate PID)
-        let _ = Command::new("notepad.exe").arg(&tmp).spawn().unwrap();
+        let mut child = Command::new("notepad.exe").arg(&tmp).spawn().unwrap();
         std::thread::sleep(Duration::from_secs(3));
 
         let checker = Win32FileOpenChecker;
@@ -435,6 +441,7 @@ mod tests {
         let _ = Command::new("taskkill")
             .args(["/IM", "notepad.exe", "/F"])
             .output();
+        let _ = child.wait();
         std::thread::sleep(Duration::from_secs(2));
 
         assert!(

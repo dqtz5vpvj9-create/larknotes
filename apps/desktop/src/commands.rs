@@ -445,7 +445,7 @@ pub async fn import_doc(
     // Ensure unique title (import goes to root folder)
     let title = state.storage.lock().map_err(lock_err)?
         .unique_title(
-            &remote_meta.map(|m| m.title.as_str()).unwrap_or(&raw_title),
+            remote_meta.map(|m| m.title.as_str()).unwrap_or(&raw_title),
             "",
             Some(&doc_id),
         )
@@ -976,7 +976,7 @@ fn insert_into_tree(
     nodes: &mut Vec<FolderTreeNode>,
     parts: &[&str],
     depth: usize,
-    full_path: &str,
+    _full_path: &str,
     doc_counts: &std::collections::HashMap<String, usize>,
 ) {
     if depth >= parts.len() {
@@ -1000,7 +1000,7 @@ fn insert_into_tree(
     };
 
     if depth + 1 < parts.len() {
-        insert_into_tree(&mut node.children, parts, depth + 1, full_path, doc_counts);
+        insert_into_tree(&mut node.children, parts, depth + 1, _full_path, doc_counts);
     }
 }
 

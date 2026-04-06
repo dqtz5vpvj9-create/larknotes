@@ -410,7 +410,7 @@ impl SyncEngine {
                     }
                     // Compare within remote hash space
                     let changed = remote_hash_cached.as_deref()
-                        .map_or(false, |cached| fresh_remote_hash != cached);
+                        .is_some_and(|cached| fresh_remote_hash != cached);
                     (changed, Some(read_output.content))
                 }
                 Err(e) => {
@@ -473,7 +473,7 @@ impl SyncEngine {
 
     /// Push local content to remote with retry logic.
     async fn push_to_remote(&self, doc_id: &str, remote_id: &str, content: &str, local_hash: &str, title: &str, old_title: Option<&str>) {
-        let title_changed = old_title.map_or(false, |old| old != title);
+        let title_changed = old_title.is_some_and(|old| old != title);
 
         let retry_delays = [
             Duration::from_secs(5),

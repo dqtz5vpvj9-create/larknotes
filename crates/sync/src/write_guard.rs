@@ -13,11 +13,17 @@ pub struct WriteGuard {
     guarded: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
-impl WriteGuard {
-    pub fn new() -> Self {
+impl Default for WriteGuard {
+    fn default() -> Self {
         Self {
             guarded: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+}
+
+impl WriteGuard {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Acquire a guard for `path`. The returned token removes the path
