@@ -2,7 +2,11 @@ use crate::state::AppState;
 use larknotes_core::*;
 use larknotes_core::{new_note_id, SyncState};
 use larknotes_editor::EditorLauncher;
+use larknotes_editor::window_monitor::WindowMonitor;
+use larknotes_storage::Storage;
 use larknotes_sync::{hash_content, SyncEvent};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 fn lock_err(e: impl std::fmt::Display) -> String {
     format!("Internal lock error: {e}")
@@ -668,19 +672,22 @@ pub async fn restore_snapshot(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub async fn quick_note(
-    state: tauri::State<'_, AppState>,
+/// Core quick-note logic, callable without a running Tauri app.
+pub fn execute_quick_note_core(
+    config: &AppConfig,
+    storage: &Storage,
+    editor: &EditorLauncher,
+    window_monitor: Option<&Arc<WindowMonitor>>,
+    sync_tx: Option<&mpsc::UnboundedSender<SyncEvent>>,
 ) -> Result<DocMeta, String> {
     let title = chrono::Local::now().format("笔记 %Y-%m-%d %H:%M:%S").to_string();
     let markdown = format!("# {title}\n\n");
 
-    let workspace_dir = state.config.read().map_err(lock_err)?.workspace_dir.clone();
-    std::fs::create_dir_all(docs_dir(&workspace_dir)).map_err(|e| e.to_string())?;
+    let workspace_dir = &config.workspace_dir;
+    std::fs::create_dir_all(docs_dir(workspace_dir)).map_err(|e| e.to_string())?;
 
-    // Desired-state: create locally with PendingCreate + title_mode=derive_once
     let note_id = new_note_id();
-    let content_path = unique_content_path(&workspace_dir, &title);
+    let content_path = unique_content_path(workspace_dir, &title);
     let hash = hash_content(markdown.as_bytes());
 
     let meta = DocMeta {
@@ -705,29 +712,39 @@ pub async fn quick_note(
         desired_path: None,
     };
 
-    {
-        let store = state.storage.lock().map_err(lock_err)?;
-        store.upsert_doc(&meta).map_err(|e| e.to_string())?;
-    }
+    storage.upsert_doc(&meta).map_err(|e| e.to_string())?;
 
     // Write file + open editor
     std::fs::write(&content_path, &markdown).map_err(|e| e.to_string())?;
 
-    {
-        let editor = state.editor.read().map_err(lock_err)?;
-        match editor.open_file(&content_path) {
-            Ok(child) => {
+    match editor.open_file(&content_path) {
+        Ok(child) => {
+            if let Some(monitor) = window_monitor {
                 let filename = content_path.file_name().unwrap().to_string_lossy().to_string();
-                state.window_monitor.track_with_child(&note_id, &filename, Some(child));
+                monitor.track_with_child(&note_id, &filename, Some(child));
             }
-            Err(e) => tracing::warn!("打开编辑器失败: {e}"),
         }
+        Err(e) => tracing::warn!("打开编辑器失败: {e}"),
     }
 
-    // Notify scheduler
-    let _ = state.sync_tx.send(SyncEvent::SyncRequested { doc_id: note_id.clone() });
+    if let Some(tx) = sync_tx {
+        let _ = tx.send(SyncEvent::SyncRequested { doc_id: note_id.clone() });
+    }
 
     Ok(meta)
+}
+
+#[tauri::command]
+pub async fn quick_note(
+    state: tauri::State<'_, AppState>,
+) -> Result<DocMeta, String> {
+    let config = state.config.read().map_err(lock_err)?.clone();
+    let storage = state.storage.lock().map_err(lock_err)?;
+    let editor = state.editor.read().map_err(lock_err)?;
+    execute_quick_note_core(
+        &config, &storage, &editor,
+        Some(&state.window_monitor), Some(&state.sync_tx),
+    )
 }
 
 #[tauri::command]
@@ -1137,4 +1154,50 @@ pub fn move_doc_to_folder(
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+// ── Start Menu shortcut management ──────────────────────────────────
+
+#[cfg(windows)]
+fn quick_note_shortcut_path() -> Result<std::path::PathBuf, String> {
+    let appdata = std::env::var("APPDATA").map_err(|e| e.to_string())?;
+    Ok(std::path::PathBuf::from(appdata)
+        .join(r"Microsoft\Windows\Start Menu\Programs")
+        .join("LarkNotes Quick Note.lnk"))
+}
+
+#[tauri::command]
+pub fn get_quick_note_shortcut_status() -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        Ok(quick_note_shortcut_path()?.exists())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+pub fn set_quick_note_shortcut(enabled: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let lnk_path = quick_note_shortcut_path()?;
+        if enabled {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let mut sl = mslnk::ShellLink::new(&exe).map_err(|e| e.to_string())?;
+            sl.set_arguments(Some("--quick-note".to_string()));
+            sl.set_name(Some("LarkNotes Quick Note".to_string()));
+            sl.set_icon_location(Some(exe.to_string_lossy().to_string()));
+            sl.create_lnk(&lnk_path).map_err(|e| e.to_string())?;
+        } else {
+            let _ = std::fs::remove_file(&lnk_path);
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err("Shortcut management is only supported on Windows".to_string())
+    }
 }

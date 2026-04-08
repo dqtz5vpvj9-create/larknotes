@@ -3,6 +3,7 @@
   import {
     setEditor, setWorkspace, detectEditors, pickFolder,
     getAutostartStatus, setAutostart, setSyncDebounce, setAutoSync, setProviderCliPath,
+    getQuickNoteShortcutStatus, setQuickNoteShortcut,
   } from "../api";
 
   interface Props {
@@ -32,6 +33,8 @@
   let saving = $state(false);
   let autostartEnabled = $state(false);
   let autostartLoading = $state(false);
+  let shortcutEnabled = $state(false);
+  let shortcutLoading = $state(false);
 
   $effect(() => { editorInput = editorCommand; });
   $effect(() => { workspaceInput = workspacePath; });
@@ -50,6 +53,11 @@
     } catch {
       // ignore — may not be available in dev mode
     }
+    try {
+      shortcutEnabled = await getQuickNoteShortcutStatus();
+    } catch {
+      // ignore
+    }
   });
 
   async function toggleAutostart() {
@@ -61,6 +69,18 @@
       onError(`设置开机启动失败: ${e}`);
     } finally {
       autostartLoading = false;
+    }
+  }
+
+  async function toggleShortcut() {
+    shortcutLoading = true;
+    try {
+      await setQuickNoteShortcut(!shortcutEnabled);
+      shortcutEnabled = !shortcutEnabled;
+    } catch (e) {
+      onError(`设置快速笔记快捷方式失败: ${e}`);
+    } finally {
+      shortcutLoading = false;
     }
   }
 
@@ -249,6 +269,25 @@
         </button>
       </div>
       <p class="field-hint">系统启动时自动在后台运行 LarkNotes</p>
+    </div>
+
+    <div class="field">
+      <div class="toggle-row">
+        <label class="field-label" for="shortcut-toggle">开始菜单快速笔记</label>
+        <button
+          id="shortcut-toggle"
+          class="toggle"
+          class:toggle--on={shortcutEnabled}
+          onclick={toggleShortcut}
+          disabled={shortcutLoading}
+          role="switch"
+          aria-checked={shortcutEnabled}
+          aria-label="开始菜单快速笔记"
+        >
+          <span class="toggle-knob"></span>
+        </button>
+      </div>
+      <p class="field-hint">在开始菜单添加「快速笔记」快捷方式，搜索即可一键新建笔记</p>
     </div>
   </div>
 
