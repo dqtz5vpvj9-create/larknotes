@@ -26,3 +26,9 @@ dirs = { workspace = true }
 rfd = "0.15"
 chrono = "0.4"
 tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+clap = { version = "4", features = ["derive"] }
+mslnk = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_Foundation"] }

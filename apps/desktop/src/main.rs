@@ -18,6 +18,76 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+#[derive(clap::Parser)]
+#[command(name = "LarkNotes")]
+struct CliArgs {
+    /// Create a quick note and open it in the editor
+    #[arg(long)]
+    quick_note: bool,
+}
+
+/// Load app config from DB without starting the full Tauri runtime.
+/// Returns (config, db_path) so callers can reuse the same DB location.
+fn load_config() -> (AppConfig, std::path::PathBuf) {
+    let mut config = AppConfig::default();
+    let db_path = config.workspace_dir.join("app.db");
+    if let Ok(storage) = Storage::new(&db_path) {
+        if let Ok(Some(editor)) = storage.get_config("editor_command") {
+            config.editor_command = editor;
+        }
+        if let Ok(Some(cli_path)) = storage.get_config("provider_cli_path") {
+            config.provider_cli_path = cli_path;
+        }
+        if let Ok(Some(ws)) = storage.get_config("workspace_dir") {
+            let p = std::path::PathBuf::from(&ws);
+            if p.exists() {
+                config.workspace_dir = p;
+            }
+        }
+        if let Ok(Some(debounce)) = storage.get_config("sync_debounce_ms") {
+            if let Ok(ms) = debounce.parse::<u64>() {
+                config.sync_debounce_ms = ms;
+            }
+        }
+        if let Ok(Some(auto)) = storage.get_config("auto_sync") {
+            config.auto_sync = auto == "true";
+        }
+    }
+    if config.editor_command == "notepad" {
+        config.editor_command = detect_editor();
+    }
+    (config, db_path)
+}
+
+/// Fast path: create a quick note and exit without starting the Tauri runtime.
+fn fast_quick_note() {
+    let (config, db_path) = load_config();
+    let storage = Storage::new(&db_path).expect("Failed to init database");
+    let editor = EditorLauncher::new(&config.editor_command);
+
+    match commands::execute_quick_note_core(&config, &storage, &editor, None, None) {
+        Ok(meta) => tracing::info!("Quick note created: {}", meta.title),
+        Err(e) => tracing::error!("Failed to create quick note: {e}"),
+    }
+}
+
+/// Check if another LarkNotes instance is already running (Windows named mutex).
+#[cfg(windows)]
+fn is_another_instance_running() -> bool {
+    use windows_sys::Win32::System::Threading::OpenMutexW;
+    use windows_sys::Win32::Foundation::{CloseHandle, SYNCHRONIZE};
+    let name: Vec<u16> = "Global\\LarkNotes\0".encode_utf16().collect();
+    unsafe {
+        let handle = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
+        if handle == 0 {
+            false
+        } else {
+            CloseHandle(handle);
+            true
+        }
+    }
+}
+
 fn main() {
     // Set up file logging: workspace/logs/larknotes-YYYY-MM-DD.log (7-day rolling)
     let log_dir = AppConfig::default().workspace_dir.join("logs");
@@ -58,23 +128,63 @@ fn main() {
         std::env::consts::ARCH,
     );
 
+    // Parse CLI arguments
+    use clap::Parser;
+    let cli = CliArgs::parse();
+
+    // Fast path: --quick-note with no running instance → create note and exit
+    #[cfg(windows)]
+    if cli.quick_note && !is_another_instance_running() {
+        fast_quick_note();
+        return;
+    }
+
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|a| a == "--quick-note") {
+                let state = app.state::<AppState>();
+                if let (Ok(config), Ok(storage), Ok(editor)) = (
+                    state.config.read(),
+                    state.storage.lock(),
+                    state.editor.read(),
+                ) {
+                    let _ = commands::execute_quick_note_core(
+                        &config, &storage, &editor,
+                        Some(&state.window_monitor), Some(&state.sync_tx),
+                    );
+                }
+            } else {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.unminimize();
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .setup(|app| {
+        .setup(move |app| {
             let app_handle = app.handle().clone();
 
-            // 1. Default config
-            let mut config = AppConfig::default();
-            let workspace_dir = config.workspace_dir.clone();
-            std::fs::create_dir_all(workspace_dir.join("docs"))?;
-            std::fs::create_dir_all(workspace_dir.join(".meta"))?;
+            // Create named mutex so fast_quick_note() can detect a running instance
+            #[cfg(windows)]
+            unsafe {
+                use windows_sys::Win32::System::Threading::CreateMutexW;
+                let name: Vec<u16> = "Global\\LarkNotes\0".encode_utf16().collect();
+                CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+                // Intentionally leaked — held for process lifetime
+            }
+
+            // 1. Load config from DB
+            let (config, db_path) = load_config();
+            let workspace = config.workspace_dir.clone();
+            std::fs::create_dir_all(workspace.join("docs"))?;
+            std::fs::create_dir_all(workspace.join(".meta"))?;
 
             // 2. Init storage
-            let db_path = workspace_dir.join("app.db");
             let storage = Arc::new(Mutex::new(
                 Storage::new(&db_path).expect("Failed to init database"),
             ));
@@ -91,7 +201,7 @@ fn main() {
 
             // 3b. Scan folder tree and register subfolders in DB
             {
-                let count = larknotes_sync::scan_folder_tree(&workspace_dir, &storage);
+                let count = larknotes_sync::scan_folder_tree(&workspace, &storage);
                 if count > 0 {
                     tracing::info!("启动时注册了 {} 个文件夹", count);
                 }
@@ -100,52 +210,19 @@ fn main() {
             // 3c. Startup path reconciliation: fix orphaned docs from
             //     external renames while app was not running
             {
-                let matches = larknotes_sync::reconcile_paths(&workspace_dir, &storage);
+                let matches = larknotes_sync::reconcile_paths(&workspace, &storage);
                 if !matches.is_empty() {
                     tracing::info!("启动时修复了 {} 个孤儿文档路径", matches.len());
                 }
             }
 
-            // 3c. Rename files whose names don't match their title.
-            //     This is deferred from editing sessions to avoid confusing editors.
+            // 3d. Rename files whose names don't match their title.
             {
-                let count = larknotes_sync::rename_stale_paths(&workspace_dir, &storage);
+                let count = larknotes_sync::rename_stale_paths(&workspace, &storage);
                 if count > 0 {
                     tracing::info!("启动时重命名了 {} 个文件以匹配标题", count);
                 }
             }
-
-            // 4. Load config from DB
-            {
-                let store = storage.lock().expect("Storage lock poisoned at init");
-                if let Ok(Some(editor)) = store.get_config("editor_command") {
-                    config.editor_command = editor;
-                }
-                if let Ok(Some(cli_path)) = store.get_config("provider_cli_path") {
-                    config.provider_cli_path = cli_path;
-                }
-                if let Ok(Some(ws)) = store.get_config("workspace_dir") {
-                    let p = std::path::PathBuf::from(&ws);
-                    if p.exists() {
-                        config.workspace_dir = p;
-                    }
-                }
-                if let Ok(Some(debounce)) = store.get_config("sync_debounce_ms") {
-                    if let Ok(ms) = debounce.parse::<u64>() {
-                        config.sync_debounce_ms = ms;
-                    }
-                }
-                if let Ok(Some(auto)) = store.get_config("auto_sync") {
-                    config.auto_sync = auto == "true";
-                }
-            }
-            if config.editor_command == "notepad" {
-                config.editor_command = detect_editor();
-            }
-
-            let workspace = config.workspace_dir.clone();
-            std::fs::create_dir_all(workspace.join("docs"))?;
-            std::fs::create_dir_all(workspace.join(".meta"))?;
 
             // 4. Read config values before wrapping in Arc
             let cli_path = config.provider_cli_path.clone();
@@ -335,6 +412,13 @@ fn main() {
             });
             app.manage(ShutdownSender(Mutex::new(Some(shutdown_tx))));
 
+            // If launched with --quick-note, hide the main window
+            if cli.quick_note {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+
             tracing::info!("LarkNotes 初始化完成");
             Ok(())
         })
@@ -373,6 +457,8 @@ fn main() {
             rename_folder,
             delete_folder,
             move_doc_to_folder,
+            get_quick_note_shortcut_status,
+            set_quick_note_shortcut,
         ])
         .build(tauri::generate_context!())
         .expect("error while building LarkNotes")

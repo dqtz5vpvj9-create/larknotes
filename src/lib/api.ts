@@ -102,3 +102,9 @@ export const moveDocToFolder = (docId: string, targetFolder: string) =>
 
 export const renameDoc = (docId: string, newTitle: string) =>
   invoke<DocMeta>("rename_doc", { docId, newTitle });
+
+export const getQuickNoteShortcutStatus = () =>
+  invoke<boolean>("get_quick_note_shortcut_status");
+
+export const setQuickNoteShortcut = (enabled: boolean) =>
+  invoke<void>("set_quick_note_shortcut", { enabled });

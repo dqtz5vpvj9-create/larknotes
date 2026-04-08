@@ -26,6 +26,9 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi"],
+    "nsis": {
+      "installerHooks": "nsis/hooks.nsi"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/icon.ico",
