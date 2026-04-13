@@ -321,6 +321,31 @@ pub fn rename_stale_paths(
                 continue;
             }
         };
+
+        // Auto-delete unchanged quick notes: if content matches the initial
+        // template ("# {title}\n\n"), the user never wrote anything.
+        let initial_content = format!("# {}\n\n", doc.title);
+        if content == initial_content {
+            let _ = std::fs::remove_file(&old_path);
+            let _ = std::fs::remove_file(meta_path(workspace, &doc.doc_id));
+            if let Ok(store) = storage.lock() {
+                if doc.remote_id.is_some() {
+                    // Has remote copy — mark for remote deletion
+                    let _ = store.update_sync_state(&doc.doc_id, &SyncState::PendingDelete);
+                    let _ = store.set_pending_rename(&doc.doc_id, false);
+                } else {
+                    // No remote copy — full local cleanup
+                    let _ = store.delete_doc(&doc.doc_id);
+                }
+            }
+            tracing::info!(
+                "rename_stale_paths: auto-deleted unchanged quick note {} (title='{}')",
+                doc.doc_id, doc.title,
+            );
+            count += 1;
+            continue;
+        }
+
         let content_title = extract_title(&content);
 
         // Check if filename already matches the content title
@@ -806,5 +831,139 @@ mod tests {
 
         let count = rename_stale_paths(tmp.path(), &storage);
         assert_eq!(count, 0, "Should skip orphan docs (file doesn't exist)");
+    }
+
+    // ─── auto-delete unchanged quick notes ────────────────
+
+    fn insert_quick_note(
+        storage: &Arc<Mutex<Storage>>,
+        note_id: &str,
+        title: &str,
+        local_path: &str,
+        remote_id: Option<&str>,
+    ) {
+        let content = format!("# {title}\n\n");
+        let meta = DocMeta {
+            note_id: note_id.to_string(),
+            remote_id: remote_id.map(|s| s.to_string()),
+            doc_id: note_id.to_string(),
+            title: title.to_string(),
+            doc_type: "DOCX".to_string(),
+            url: String::new(),
+            owner_name: String::new(),
+            created_at: "2026-01-01".to_string(),
+            updated_at: "2026-01-01".to_string(),
+            local_path: Some(local_path.to_string()),
+            content_hash: Some(hash_content(content.as_bytes())),
+            sync_status: SyncStatus::New,
+            folder_path: String::new(),
+            file_size: None,
+            word_count: None,
+            sync_state: SyncState::PendingCreate,
+            title_mode: "derive_once".to_string(),
+            desired_title: None,
+            desired_path: None,
+        };
+        storage.lock().unwrap().upsert_doc(&meta).unwrap();
+    }
+
+    #[test]
+    fn test_auto_delete_unchanged_quick_note() {
+        let (tmp, storage) = setup_reconcile_test();
+        let title = "笔记 2026-04-13 14:30:45";
+        let content = format!("# {title}\n\n");
+
+        let path = tmp.path().join("docs").join(format!("{title}.md"));
+        std::fs::write(&path, &content).unwrap();
+
+        insert_quick_note(
+            &storage, "qn1", title,
+            &path.to_string_lossy(), None,
+        );
+
+        let count = rename_stale_paths(tmp.path(), &storage);
+        assert_eq!(count, 1);
+        assert!(!path.exists(), "Unchanged quick note file should be deleted");
+        assert!(
+            storage.lock().unwrap().get_doc("qn1").unwrap().is_none(),
+            "DB entry should be deleted for unchanged quick note without remote_id",
+        );
+    }
+
+    #[test]
+    fn test_auto_delete_unchanged_quick_note_with_remote_id() {
+        let (tmp, storage) = setup_reconcile_test();
+        let title = "笔记 2026-04-13 15:00:00";
+        let content = format!("# {title}\n\n");
+
+        let path = tmp.path().join("docs").join(format!("{title}.md"));
+        std::fs::write(&path, &content).unwrap();
+
+        insert_quick_note(
+            &storage, "qn2", title,
+            &path.to_string_lossy(), Some("remote_abc"),
+        );
+
+        let count = rename_stale_paths(tmp.path(), &storage);
+        assert_eq!(count, 1);
+        assert!(!path.exists(), "Unchanged quick note file should be deleted");
+
+        // DB entry should remain but be marked PendingDelete for remote cleanup
+        let doc = storage.lock().unwrap().get_doc("qn2").unwrap()
+            .expect("DB entry should still exist for note with remote_id");
+        assert_eq!(doc.sync_state, SyncState::PendingDelete);
+        assert_eq!(doc.title_mode, "manual", "title_mode should be cleared");
+    }
+
+    #[test]
+    fn test_no_delete_modified_quick_note() {
+        let (tmp, storage) = setup_reconcile_test();
+        let title = "笔记 2026-04-13 16:00:00";
+        let content = format!("# {title}\n\nUser wrote some content here.");
+
+        // Use titled_content_path to match production path (sanitizes colons)
+        let path = titled_content_path(tmp.path(), title);
+        std::fs::write(&path, &content).unwrap();
+
+        insert_quick_note(
+            &storage, "qn3", title,
+            &path.to_string_lossy(), None,
+        );
+
+        let count = rename_stale_paths(tmp.path(), &storage);
+        // Filename already matches title, so no rename needed — but NOT deleted
+        assert_eq!(count, 0);
+        assert!(path.exists(), "Modified quick note should NOT be deleted");
+        assert!(
+            storage.lock().unwrap().get_doc("qn3").unwrap().is_some(),
+            "DB entry should still exist for modified quick note",
+        );
+    }
+
+    #[test]
+    fn test_no_delete_quick_note_with_new_title() {
+        let (tmp, storage) = setup_reconcile_test();
+        let title = "笔记 2026-04-13 17:00:00";
+        // User changed the heading to a new title
+        let content = "# Meeting Notes\n\nSome meeting content";
+
+        let path = tmp.path().join("docs").join(format!("{title}.md"));
+        std::fs::write(&path, content).unwrap();
+
+        insert_quick_note(
+            &storage, "qn4", title,
+            &path.to_string_lossy(), None,
+        );
+
+        let count = rename_stale_paths(tmp.path(), &storage);
+        // Should rename to "Meeting Notes.md", not delete
+        assert_eq!(count, 1);
+        assert!(!path.exists(), "Old file should be renamed away");
+        let new_path = tmp.path().join("docs").join("Meeting Notes.md");
+        assert!(new_path.exists(), "File should be renamed to match new title");
+        assert!(
+            storage.lock().unwrap().get_doc("qn4").unwrap().is_some(),
+            "DB entry should still exist after rename",
+        );
     }
 }
