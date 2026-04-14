@@ -134,22 +134,12 @@ impl Executor {
                         }
                     }
 
-                    // Read back remote content to set remote_base_hash (P5)
-                    let remote_hash = match self.provider.read(&effective_remote_id).await {
-                        Ok(read_output) => Some(hash_content(read_output.content.as_bytes())),
-                        Err(e) => {
-                            tracing::warn!("push: post-write read failed for {note_id}: {e}");
-                            None
-                        }
-                    };
-
-                    // Update baselines
+                    // Use local hash as remote baseline — we just wrote this content.
+                    // Skips an extra fetch round-trip. Lark's markdown export may
+                    // differ slightly from what we uploaded, but the next pull cycle
+                    // will reconcile if needed.
                     if let Ok(store) = self.storage.lock() {
-                        if let Some(ref rh) = remote_hash {
-                            let _ = store.set_baselines(note_id, local_hash, rh);
-                        } else {
-                            let _ = store.update_content_hash(note_id, local_hash);
-                        }
+                        let _ = store.set_baselines(note_id, local_hash, local_hash);
                         let _ = store.update_sync_status(note_id, &SyncStatus::Synced);
                         let _ = store.update_sync_state(note_id, &SyncState::Synced);
                         let _ = store.add_sync_history(note_id, "push", Some(local_hash));
@@ -236,18 +226,13 @@ impl Executor {
     // ─── CreateRemote ───────────────────────────────────
 
     async fn execute_create_remote(&self, note_id: &str, content: &str, title: &str) {
-        tracing::info!("create_remote: starting for {note_id} (title={title:?}, content_len={})", content.len());
         let op_id = self.enqueue("create_remote", note_id, None);
-        if op_id.is_none() {
-            tracing::warn!("create_remote: enqueue returned None for {note_id}");
-            return;
-        }
+        if op_id.is_none() { return; }
         let op_id = op_id.unwrap();
 
         self.emit(note_id, SyncStatus::Syncing, None);
         self.set_sync_state(note_id, &SyncState::Executing);
 
-        tracing::info!("create_remote: calling provider.create for {note_id}");
         match self.provider.create(title, content).await {
             Ok(created_meta) => {
                 // Extract remote_id from provider response
@@ -262,11 +247,9 @@ impl Executor {
                 };
                 let local_hash = hash_content(content.as_bytes());
 
-                // Read back remote content for accurate remote_base_hash (P5)
-                let remote_hash = match self.provider.read(remote_id).await {
-                    Ok(read_output) => hash_content(read_output.content.as_bytes()),
-                    Err(_) => local_hash.clone(), // fallback: assume same
-                };
+                // Use local hash as remote baseline — we just uploaded this content,
+                // so they match. Skips an extra fetch round-trip (~2-20s).
+                let remote_hash = local_hash.clone();
 
                 if let Ok(store) = self.storage.lock() {
                     let _ = store.update_remote_id(note_id, remote_id);
