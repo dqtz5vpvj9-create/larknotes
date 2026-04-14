@@ -168,7 +168,7 @@ impl CliProvider {
 
         // 2. Success exit code — parse stdout normally
         if !stderr.is_empty() {
-            tracing::warn!("lark-cli stderr: {stderr}");
+            tracing::debug!("lark-cli stderr: {stderr}");
         }
 
         parse_cli_output(&stdout)
