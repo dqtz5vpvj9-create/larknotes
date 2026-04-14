@@ -236,13 +236,18 @@ impl Executor {
     // ─── CreateRemote ───────────────────────────────────
 
     async fn execute_create_remote(&self, note_id: &str, content: &str, title: &str) {
+        tracing::info!("create_remote: starting for {note_id} (title={title:?}, content_len={})", content.len());
         let op_id = self.enqueue("create_remote", note_id, None);
-        if op_id.is_none() { return; }
+        if op_id.is_none() {
+            tracing::warn!("create_remote: enqueue returned None for {note_id}");
+            return;
+        }
         let op_id = op_id.unwrap();
 
         self.emit(note_id, SyncStatus::Syncing, None);
         self.set_sync_state(note_id, &SyncState::Executing);
 
+        tracing::info!("create_remote: calling provider.create for {note_id}");
         match self.provider.create(title, content).await {
             Ok(created_meta) => {
                 // Extract remote_id from provider response
