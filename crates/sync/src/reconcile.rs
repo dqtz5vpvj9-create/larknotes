@@ -870,7 +870,7 @@ mod tests {
     #[test]
     fn test_auto_delete_unchanged_quick_note() {
         let (tmp, storage) = setup_reconcile_test();
-        let title = "笔记 2026-04-13 14:30:45";
+        let title = "笔记 2026-04-13 14_30_45";
         let content = format!("# {title}\n\n");
 
         let path = tmp.path().join("docs").join(format!("{title}.md"));
@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn test_auto_delete_unchanged_quick_note_with_remote_id() {
         let (tmp, storage) = setup_reconcile_test();
-        let title = "笔记 2026-04-13 15:00:00";
+        let title = "笔记 2026-04-13 15_00_00";
         let content = format!("# {title}\n\n");
 
         let path = tmp.path().join("docs").join(format!("{title}.md"));
@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn test_no_delete_quick_note_with_new_title() {
         let (tmp, storage) = setup_reconcile_test();
-        let title = "笔记 2026-04-13 17:00:00";
+        let title = "笔记 2026-04-13 17_00_00";
         // User changed the heading to a new title
         let content = "# Meeting Notes\n\nSome meeting content";
 
