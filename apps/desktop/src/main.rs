@@ -74,12 +74,12 @@ fn fast_quick_note() {
 /// Check if another LarkNotes instance is already running (Windows named mutex).
 #[cfg(windows)]
 fn is_another_instance_running() -> bool {
-    use windows_sys::Win32::System::Threading::OpenMutexW;
-    use windows_sys::Win32::Foundation::{CloseHandle, SYNCHRONIZE};
+    use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    use windows_sys::Win32::Foundation::CloseHandle;
     let name: Vec<u16> = "Global\\LarkNotes\0".encode_utf16().collect();
     unsafe {
-        let handle = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
-        if handle == 0 {
+        let handle = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
+        if handle.is_null() {
             false
         } else {
             CloseHandle(handle);
@@ -143,11 +143,12 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if args.iter().any(|a| a == "--quick-note") {
                 let state = app.state::<AppState>();
-                if let (Ok(config), Ok(storage), Ok(editor)) = (
+                let result = (
                     state.config.read(),
                     state.storage.lock(),
                     state.editor.read(),
-                ) {
+                );
+                if let (Ok(config), Ok(storage), Ok(editor)) = result {
                     let _ = commands::execute_quick_note_core(
                         &config, &storage, &editor,
                         Some(&state.window_monitor), Some(&state.sync_tx),
