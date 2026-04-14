@@ -84,6 +84,11 @@ impl CliProvider {
     }
 
     async fn run_cli(&self, args: &[&str]) -> Result<serde_json::Value, LarkNotesError> {
+        self.run_cli_in_dir(args, None).await
+    }
+
+    /// Run lark-cli, optionally with a specific working directory.
+    async fn run_cli_in_dir(&self, args: &[&str], cwd: Option<&std::path::Path>) -> Result<serde_json::Value, LarkNotesError> {
         let cli_path = self.cli_path.read()
             .map_err(|e| LarkNotesError::Cli(format!("Lock error: {e}")))?
             .clone();
@@ -103,6 +108,7 @@ impl CliProvider {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .creation_flags(0x08000000);
+                if let Some(dir) = cwd { cmd.current_dir(dir); }
                 cmd.output()
                     .await
                     .map_err(|e| LarkNotesError::Cli(format!("启动lark-cli失败: {e}")))?
@@ -110,25 +116,29 @@ impl CliProvider {
                 // Fallback to cmd /C for simple commands
                 let mut cmd_args = vec!["/C", &cli_path as &str];
                 cmd_args.extend_from_slice(args);
-                Command::new("cmd")
-                    .args(&cmd_args)
+                let mut cmd = Command::new("cmd");
+                cmd.args(&cmd_args)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
-                    .creation_flags(0x08000000)
-                    .output()
+                    .creation_flags(0x08000000);
+                if let Some(dir) = cwd { cmd.current_dir(dir); }
+                cmd.output()
                     .await
                     .map_err(|e| LarkNotesError::Cli(format!("启动lark-cli失败: {e}")))?
             }
         };
 
         #[cfg(not(windows))]
-        let output = Command::new(&cli_path)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| LarkNotesError::Cli(format!("启动lark-cli失败: {e}")))?;
+        let output = {
+            let mut cmd = Command::new(&cli_path);
+            cmd.args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(dir) = cwd { cmd.current_dir(dir); }
+            cmd.output()
+                .await
+                .map_err(|e| LarkNotesError::Cli(format!("启动lark-cli失败: {e}")))?
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -357,6 +367,59 @@ pub fn parse_fetch_response(json: &serde_json::Value) -> String {
     unescape_markdown(raw)
 }
 
+/// Max content length (in bytes) that can be safely passed as a CLI argument.
+/// Windows CreateProcess limits the command line to ~32K characters.
+const MAX_CLI_ARG_LEN: usize = 30_000;
+
+impl CliProvider {
+    /// Import a markdown string as a new Lark docx via `drive +import`.
+    /// Writes content to a temp file, invokes `lark-cli drive +import --file ./temp.md --type docx`,
+    /// and returns (token, url) of the newly created document.
+    async fn import_markdown(&self, name: &str, content: &str) -> Result<(String, String), LarkNotesError> {
+        let tmp_dir = std::env::temp_dir().join("larknotes-import");
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| LarkNotesError::Cli(format!("创建临时目录失败: {e}")))?;
+
+        let file_name = format!("{}.md", sanitize_filename(name));
+        let tmp_file = tmp_dir.join(&file_name);
+        std::fs::write(&tmp_file, content)
+            .map_err(|e| LarkNotesError::Cli(format!("写入临时文件失败: {e}")))?;
+
+        let rel_path = format!("./{file_name}");
+        let result = self.run_cli_in_dir(
+            &["drive", "+import", "--file", &rel_path, "--type", "docx", "--name", name],
+            Some(&tmp_dir),
+        ).await;
+
+        // Clean up temp file regardless of result
+        let _ = std::fs::remove_file(&tmp_file);
+
+        let json = result?;
+        let token = json.pointer("/data/token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let url = json.pointer("/data/url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if token.is_empty() {
+            return Err(LarkNotesError::Cli("import返回的token为空".to_string()));
+        }
+        Ok((token, url))
+    }
+}
+
+/// Replace characters that are invalid in file names.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl ProviderAuth for CliProvider {
     async fn auth_status(&self) -> Result<AuthStatus, LarkNotesError> {
@@ -368,6 +431,31 @@ impl ProviderAuth for CliProvider {
 #[async_trait::async_trait]
 impl DocProvider for CliProvider {
     async fn create(&self, name: &str, content: &str) -> Result<DocMeta, LarkNotesError> {
+        if content.len() > MAX_CLI_ARG_LEN {
+            // Large content: use drive +import to avoid CLI arg length limits
+            let (token, url) = self.import_markdown(name, content).await?;
+            return Ok(DocMeta {
+                note_id: String::new(),
+                remote_id: Some(token),
+                doc_id: String::new(),
+                title: name.to_string(),
+                doc_type: "DOCX".to_string(),
+                url,
+                owner_name: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                local_path: None,
+                content_hash: None,
+                sync_status: SyncStatus::Synced,
+                folder_path: String::new(),
+                file_size: None,
+                word_count: None,
+                sync_state: SyncState::Synced,
+                title_mode: "manual".to_string(),
+                desired_title: None,
+                desired_path: None,
+            });
+        }
         let json = self
             .run_cli(&["docs", "+create", "--title", name, "--markdown", content])
             .await?;
@@ -423,16 +511,32 @@ impl DocProvider for CliProvider {
     }
 
     async fn write(&self, id: &str, content: &str) -> Result<WriteMeta, LarkNotesError> {
+        if content.len() > MAX_CLI_ARG_LEN {
+            // Large content: delete old doc + reimport to avoid CLI arg length limits.
+            // Try to read the old title before deleting.
+            let title = match self.read(id).await {
+                Ok(ro) => ro.meta.title,
+                Err(_) => String::new(),
+            };
+            let _ = self.delete(id).await; // best-effort delete
+            let (new_token, new_url) = self.import_markdown(&title, content).await?;
+            return Ok(WriteMeta {
+                content_hash: String::new(),
+                updated_at: chrono::Local::now().to_rfc3339(),
+                new_remote_id: Some(new_token),
+                new_url: Some(new_url),
+            });
+        }
         self.run_cli(&[
             "docs", "+update", "--doc", id,
             "--mode", "overwrite",
             "--markdown", content,
         ]).await?;
         Ok(WriteMeta {
-            // CLI doesn't return a server-side hash; the caller (sync engine)
-            // computes its own local hash and uses that for change detection.
             content_hash: String::new(),
             updated_at: chrono::Local::now().to_rfc3339(),
+            new_remote_id: None,
+            new_url: None,
         })
     }
 

@@ -79,6 +79,12 @@ pub struct ReadOutput {
 pub struct WriteMeta {
     pub content_hash: String,
     pub updated_at: String,
+    /// When the write was performed via delete+reimport (large content),
+    /// this contains the new remote document ID and URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_remote_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
