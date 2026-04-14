@@ -86,7 +86,9 @@ impl Executor {
         let remote_id = match self.get_remote_id(note_id) {
             Some(id) => id,
             None => {
-                tracing::warn!("push: no remote_id for note {note_id}");
+                // No remote doc yet — fall back to create_remote instead of silently dropping.
+                tracing::info!("push: no remote_id for {note_id}, falling back to create_remote");
+                self.execute_create_remote(note_id, content, title).await;
                 return;
             }
         };
