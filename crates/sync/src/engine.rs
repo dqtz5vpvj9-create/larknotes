@@ -1070,6 +1070,8 @@ mod tests {
             Ok(WriteMeta {
                 content_hash: String::new(),
                 updated_at: chrono::Local::now().to_rfc3339(),
+                new_remote_id: None,
+                new_url: None,
             })
         }
         async fn delete(&self, _id: &str) -> Result<(), LarkNotesError> {

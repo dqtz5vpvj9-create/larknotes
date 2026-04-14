@@ -109,17 +109,31 @@ impl Executor {
 
         loop {
             match self.provider.write(&remote_id, content).await {
-                Ok(_write_meta) => {
+                Ok(write_meta) => {
+                    // If write was performed via reimport, update remote_id and url
+                    let effective_remote_id = if let Some(ref new_id) = write_meta.new_remote_id {
+                        if let Ok(store) = self.storage.lock() {
+                            let _ = store.update_remote_id(note_id, new_id);
+                            if let Some(ref new_url) = write_meta.new_url {
+                                let _ = store.update_url(note_id, new_url);
+                            }
+                        }
+                        tracing::info!("push: reimported {note_id} → new remote_id {new_id}");
+                        new_id.clone()
+                    } else {
+                        remote_id.clone()
+                    };
+
                     // Title changed? Rename on remote too.
                     let old_title = self.get_title(note_id);
                     if old_title.as_deref() != Some(title) {
-                        if let Err(e) = self.provider.rename(&remote_id, title).await {
+                        if let Err(e) = self.provider.rename(&effective_remote_id, title).await {
                             tracing::error!("push: remote rename failed for {note_id}: {e}");
                         }
                     }
 
                     // Read back remote content to set remote_base_hash (P5)
-                    let remote_hash = match self.provider.read(&remote_id).await {
+                    let remote_hash = match self.provider.read(&effective_remote_id).await {
                         Ok(read_output) => Some(hash_content(read_output.content.as_bytes())),
                         Err(e) => {
                             tracing::warn!("push: post-write read failed for {note_id}: {e}");

@@ -364,14 +364,99 @@ const MAX_CLI_ARG_LEN: usize = 30_000;
 /// Write content to a temp file and return the `@path` string for lark-cli's
 /// `--markdown @file` input mode (supported since lark-cli v1.0.3+).
 /// The caller must clean up the file after the CLI call.
-fn write_temp_markdown(content: &str) -> Result<PathBuf, LarkNotesError> {
-    let tmp_dir = std::env::temp_dir().join("larknotes");
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| LarkNotesError::Cli(format!("创建临时目录失败: {e}")))?;
-    let tmp_file = tmp_dir.join(format!("sync-{}.md", std::process::id()));
-    std::fs::write(&tmp_file, content)
-        .map_err(|e| LarkNotesError::Cli(format!("写入临时文件失败: {e}")))?;
-    Ok(tmp_file)
+/// Replace characters that are invalid in file names.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect()
+}
+
+impl CliProvider {
+    /// Import a markdown string as a new Lark docx via `drive +import`.
+    /// Writes content to a temp file with built-in polling for completion.
+    async fn import_markdown(&self, name: &str, content: &str) -> Result<serde_json::Value, LarkNotesError> {
+        let tmp_dir = std::env::temp_dir().join("larknotes-import");
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| LarkNotesError::Cli(format!("创建临时目录失败: {e}")))?;
+
+        let file_name = format!("{}.md", sanitize_filename(name));
+        let tmp_file = tmp_dir.join(&file_name);
+        std::fs::write(&tmp_file, content)
+            .map_err(|e| LarkNotesError::Cli(format!("写入临时文件失败: {e}")))?;
+
+        let rel_path = format!("./{file_name}");
+        let result = self.run_cli_in_dir(
+            &["drive", "+import", "--file", &rel_path, "--type", "docx", "--name", name],
+            &tmp_dir,
+        ).await;
+
+        let _ = std::fs::remove_file(&tmp_file);
+        result
+    }
+
+    /// Run lark-cli with a specific working directory (needed for drive +import
+    /// which requires relative file paths).
+    async fn run_cli_in_dir(&self, args: &[&str], cwd: &std::path::Path) -> Result<serde_json::Value, LarkNotesError> {
+        let cli_path = self.cli_path.read()
+            .map_err(|e| LarkNotesError::Cli(format!("Lock error: {e}")))?
+            .clone();
+
+        tracing::debug!("lark-cli (cwd={}) {}", cwd.display(), args.join(" "));
+
+        #[cfg(windows)]
+        let output = {
+            let resolved = self.resolved.read()
+                .map_err(|e| LarkNotesError::Cli(format!("Lock error: {e}")))?
+                .clone();
+            if let Some((node_path, script_path)) = &resolved {
+                let mut cmd = Command::new(node_path);
+                cmd.arg(script_path)
+                    .args(args)
+                    .current_dir(cwd)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .creation_flags(0x08000000);
+                cmd.output()
+                    .await
+                    .map_err(|e| LarkNotesError::Cli(format!("启动lark-cli失败: {e}")))?
+            } else {
+                let mut cmd_args = vec!["/C", &cli_path as &str];
+                cmd_args.extend_from_slice(args);
+                Command::new("cmd")
+                    .args(&cmd_args)
+                    .current_dir(cwd)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .creation_flags(0x08000000)
+                    .output()
+                    .await
+                    .map_err(|e| LarkNotesError::Cli(format!("启动lark-cli失败: {e}")))?
+            }
+        };
+
+        #[cfg(not(windows))]
+        let output = Command::new(&cli_path)
+            .args(args)
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| LarkNotesError::Cli(format!("启动lark-cli失败: {e}")))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(LarkNotesError::Cli(
+                stderr.trim().to_string().chars().take(500).collect()
+            ));
+        }
+        parse_cli_output(&stdout)
+    }
+
 }
 
 #[async_trait::async_trait]
@@ -385,16 +470,46 @@ impl ProviderAuth for CliProvider {
 #[async_trait::async_trait]
 impl DocProvider for CliProvider {
     async fn create(&self, name: &str, content: &str) -> Result<DocMeta, LarkNotesError> {
-        let json = if content.len() > MAX_CLI_ARG_LEN {
-            // Large content: write temp file, use --markdown @file (lark-cli v1.0.3+)
-            let tmp = write_temp_markdown(content)?;
-            let at_path = format!("@{}", tmp.display());
-            let result = self.run_cli(&["docs", "+create", "--title", name, "--markdown", &at_path]).await;
-            let _ = std::fs::remove_file(&tmp);
-            result?
-        } else {
-            self.run_cli(&["docs", "+create", "--title", name, "--markdown", content]).await?
-        };
+        if content.len() > MAX_CLI_ARG_LEN {
+            // Large content: use drive +import (has built-in polling, unlike
+            // docs +create which returns an async MCP task for large content).
+            let json = self.import_markdown(name, content).await?;
+            let token = json.pointer("/data/token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let url = json.pointer("/data/url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if token.is_empty() {
+                return Err(LarkNotesError::Cli("import返回的token为空".to_string()));
+            }
+            return Ok(DocMeta {
+                note_id: String::new(),
+                remote_id: Some(token),
+                doc_id: String::new(),
+                title: name.to_string(),
+                doc_type: "DOCX".to_string(),
+                url,
+                owner_name: String::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                local_path: None,
+                content_hash: None,
+                sync_status: SyncStatus::Synced,
+                folder_path: String::new(),
+                file_size: None,
+                word_count: None,
+                sync_state: SyncState::Synced,
+                title_mode: "manual".to_string(),
+                desired_title: None,
+                desired_path: None,
+            });
+        }
+        let json = self
+            .run_cli(&["docs", "+create", "--title", name, "--markdown", content])
+            .await?;
         parse_create_response(&json, name)
     }
 
@@ -448,26 +563,42 @@ impl DocProvider for CliProvider {
 
     async fn write(&self, id: &str, content: &str) -> Result<WriteMeta, LarkNotesError> {
         if content.len() > MAX_CLI_ARG_LEN {
-            // Large content: write temp file, use --markdown @file (lark-cli v1.0.3+)
-            let tmp = write_temp_markdown(content)?;
-            let at_path = format!("@{}", tmp.display());
-            let result = self.run_cli(&[
-                "docs", "+update", "--doc", id,
-                "--mode", "overwrite",
-                "--markdown", &at_path,
-            ]).await;
-            let _ = std::fs::remove_file(&tmp);
-            result?;
-        } else {
-            self.run_cli(&[
-                "docs", "+update", "--doc", id,
-                "--mode", "overwrite",
-                "--markdown", content,
-            ]).await?;
+            // Large content: docs +update returns an async MCP task that lark-cli
+            // doesn't poll, so use delete + drive +import instead.
+            let title = match self.read(id).await {
+                Ok(ro) => ro.meta.title,
+                Err(_) => String::new(),
+            };
+            let _ = self.delete(id).await; // best-effort delete
+            let json = self.import_markdown(&title, content).await?;
+            let new_token = json.pointer("/data/token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let new_url = json.pointer("/data/url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if new_token.is_empty() {
+                return Err(LarkNotesError::Cli("import返回的token为空".to_string()));
+            }
+            return Ok(WriteMeta {
+                content_hash: String::new(),
+                updated_at: chrono::Local::now().to_rfc3339(),
+                new_remote_id: Some(new_token),
+                new_url: Some(new_url),
+            });
         }
+        self.run_cli(&[
+            "docs", "+update", "--doc", id,
+            "--mode", "overwrite",
+            "--markdown", content,
+        ]).await?;
         Ok(WriteMeta {
             content_hash: String::new(),
             updated_at: chrono::Local::now().to_rfc3339(),
+            new_remote_id: None,
+            new_url: None,
         })
     }
 
