@@ -23,7 +23,7 @@ larknotes-sync = { path = "../../crates/sync" }
 larknotes-editor = { path = "../../crates/editor" }
 which = { workspace = true }
 dirs = { workspace = true }
-rfd = "0.15"
+rfd = "0.17"
 chrono = "0.4"
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
