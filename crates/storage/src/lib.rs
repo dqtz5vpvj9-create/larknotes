@@ -122,6 +122,34 @@ impl Storage {
             tracing::info!("数据库迁移完成: v7 (note_id / sync_ops / worktree_snapshot)");
         }
 
+        // ── v8: track remote modify_time + modify_user for sync ────
+        // Replaces hash-based remote-change detection (which falsely
+        // triggered on Lark's content normalisation after every push)
+        // with Lark's authoritative latest_modify_time / latest_modify_user.
+        if current_version < 8 {
+            self.migrate_v8()?;
+            self.conn
+                .execute("INSERT INTO schema_version (version) VALUES (8)", [])
+                .map_err(|e| LarkNotesError::Storage(format!("记录迁移版本失败: {e}")))?;
+            tracing::info!("数据库迁移完成: v8 (remote_modify_time / remote_modify_user)");
+        }
+
+        Ok(())
+    }
+
+    fn migrate_v8(&self) -> Result<(), LarkNotesError> {
+        // Additive: NULL means "no baseline yet, treat next observation as new".
+        for sql in [
+            "ALTER TABLE notes ADD COLUMN remote_modify_time INTEGER;",
+            "ALTER TABLE notes ADD COLUMN remote_modify_user TEXT;",
+        ] {
+            if let Err(e) = self.conn.execute_batch(sql) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(LarkNotesError::Storage(format!("v8迁移失败: {e}")));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -876,6 +904,57 @@ impl Storage {
             )
             .map_err(|e| LarkNotesError::Storage(format!("更新基线失败: {e}")))?;
         Ok(())
+    }
+
+    /// Update only the local content baseline (after a push: we just sent
+    /// these bytes, so this is the new local-side reference for detecting
+    /// future user edits).
+    pub fn set_local_baseline(&self, note_id: &str, local_base: &str) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "UPDATE notes SET local_base_hash = ?1 WHERE note_id = ?2",
+                params![local_base, note_id],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("更新本地基线失败: {e}")))?;
+        Ok(())
+    }
+
+    /// Persist the latest_modify_time / latest_modify_user reported by Lark
+    /// as the remote-change baseline. Future polls that observe the same
+    /// pair authored by the same user can skip a content fetch entirely.
+    pub fn set_remote_modify_baseline(
+        &self,
+        note_id: &str,
+        modify_time: i64,
+        modify_user: &str,
+    ) -> Result<(), LarkNotesError> {
+        self.conn
+            .execute(
+                "UPDATE notes SET remote_modify_time = ?1, remote_modify_user = ?2 \
+                 WHERE note_id = ?3",
+                params![modify_time, modify_user, note_id],
+            )
+            .map_err(|e| LarkNotesError::Storage(format!("更新远端修改基线失败: {e}")))?;
+        Ok(())
+    }
+
+    pub fn get_remote_modify_baseline(
+        &self,
+        note_id: &str,
+    ) -> Result<Option<(i64, String)>, LarkNotesError> {
+        self.conn
+            .query_row(
+                "SELECT remote_modify_time, remote_modify_user FROM notes WHERE note_id = ?1",
+                params![note_id],
+                |row| {
+                    let t: Option<i64> = row.get(0)?;
+                    let u: Option<String> = row.get(1)?;
+                    Ok(t.zip(u))
+                },
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+            .map_err(|e| LarkNotesError::Storage(format!("查询远端修改基线失败: {e}")))
     }
 
     /// Legacy compat: set both hashes to the same value.

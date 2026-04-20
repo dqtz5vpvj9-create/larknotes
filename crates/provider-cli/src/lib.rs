@@ -6,6 +6,9 @@ use std::process::Stdio;
 use std::sync::RwLock;
 use tokio::process::Command;
 
+pub mod math;
+pub mod test_support;
+
 pub struct CliProvider {
     cli_path: RwLock<String>,
     /// On Windows, resolved node.exe + script path to bypass cmd.exe arg mangling
@@ -217,6 +220,98 @@ fn unescape_markdown(s: &str) -> String {
         .replace("\\_", "_")
 }
 
+/// Convert `<lark-table>` HTML blocks to markdown pipe tables.
+fn lark_tables_to_markdown(s: &str) -> String {
+    use std::fmt::Write;
+
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+
+    while let Some(start) = rest.find("<lark-table") {
+        // Copy everything before this table
+        result.push_str(&rest[..start]);
+
+        // Find the closing tag
+        let Some(end) = rest[start..].find("</lark-table>") else {
+            // Malformed — keep the rest as-is
+            result.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let table_end = start + end + "</lark-table>".len();
+        let table_html = &rest[start..table_end];
+        rest = &rest[table_end..];
+
+        // Check if the table has a header row
+        let has_header = table_html.contains("header-row=\"true\"");
+
+        // Parse rows
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut row_rest = table_html;
+        while let Some(tr_start) = row_rest.find("<lark-tr>") {
+            let after_tr = &row_rest[tr_start + "<lark-tr>".len()..];
+            let Some(tr_end) = after_tr.find("</lark-tr>") else { break };
+            let tr_content = &after_tr[..tr_end];
+            row_rest = &after_tr[tr_end + "</lark-tr>".len()..];
+
+            // Parse cells within this row
+            let mut cells: Vec<String> = Vec::new();
+            let mut cell_rest = tr_content;
+            while let Some(td_start) = cell_rest.find("<lark-td>") {
+                let after_td = &cell_rest[td_start + "<lark-td>".len()..];
+                let Some(td_end) = after_td.find("</lark-td>") else { break };
+                let cell_text = after_td[..td_end].trim().to_string();
+                cells.push(cell_text);
+                cell_rest = &after_td[td_end + "</lark-td>".len()..];
+            }
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+        }
+
+        if rows.is_empty() {
+            continue;
+        }
+
+        // Compute column widths for alignment
+        let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut col_widths = vec![3usize; num_cols]; // minimum "---"
+        for row in &rows {
+            for (i, cell) in row.iter().enumerate() {
+                if i < num_cols {
+                    col_widths[i] = col_widths[i].max(cell.len());
+                }
+            }
+        }
+
+        // Build markdown table
+        let mut table = String::new();
+        for (row_idx, row) in rows.iter().enumerate() {
+            let _ = write!(table, "|");
+            for col in 0..num_cols {
+                let cell = row.get(col).map(|s| s.as_str()).unwrap_or("");
+                let _ = write!(table, " {:<width$} |", cell, width = col_widths[col]);
+            }
+            let _ = writeln!(table);
+
+            // Insert separator after header row
+            if row_idx == 0 && has_header {
+                let _ = write!(table, "|");
+                for col in 0..num_cols {
+                    let _ = write!(table, " {:-<width$} |", "", width = col_widths[col]);
+                }
+                let _ = writeln!(table);
+            }
+        }
+
+        result.push_str(table.trim_end());
+        result.push('\n');
+    }
+
+    result.push_str(rest);
+    result
+}
+
 /// Parse auth status from CLI JSON output.
 pub fn parse_auth_status(json: &serde_json::Value) -> AuthStatus {
     let token_status = json
@@ -228,6 +323,7 @@ pub fn parse_auth_status(json: &serde_json::Value) -> AuthStatus {
     AuthStatus {
         logged_in,
         user_name: json.get("userName").and_then(|v| v.as_str()).map(String::from),
+        user_open_id: json.get("userOpenId").and_then(|v| v.as_str()).map(String::from),
         expires_at: json.get("expiresAt").and_then(|v| v.as_str()).map(String::from),
         needs_refresh: token_status == "needs_refresh",
     }
@@ -354,7 +450,8 @@ pub fn parse_fetch_response(json: &serde_json::Value) -> String {
     let raw = json.pointer("/data/markdown")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    unescape_markdown(raw)
+    let md = unescape_markdown(raw);
+    lark_tables_to_markdown(&md)
 }
 
 /// Max content length (in bytes) that can be safely passed as a CLI argument.
@@ -377,7 +474,12 @@ fn sanitize_filename(name: &str) -> String {
 impl CliProvider {
     /// Import a markdown string as a new Lark docx via `drive +import`.
     /// Writes content to a temp file with built-in polling for completion.
-    async fn import_markdown(&self, name: &str, content: &str) -> Result<serde_json::Value, LarkNotesError> {
+    async fn import_markdown(
+        &self,
+        name: &str,
+        content: &str,
+        folder_token: Option<&str>,
+    ) -> Result<serde_json::Value, LarkNotesError> {
         let tmp_dir = std::env::temp_dir().join("larknotes-import");
         std::fs::create_dir_all(&tmp_dir)
             .map_err(|e| LarkNotesError::Cli(format!("创建临时目录失败: {e}")))?;
@@ -388,10 +490,14 @@ impl CliProvider {
             .map_err(|e| LarkNotesError::Cli(format!("写入临时文件失败: {e}")))?;
 
         let rel_path = format!("./{file_name}");
-        let result = self.run_cli_in_dir(
-            &["drive", "+import", "--file", &rel_path, "--type", "docx", "--name", name],
-            &tmp_dir,
-        ).await;
+        let mut args: Vec<&str> = vec![
+            "drive", "+import", "--file", &rel_path, "--type", "docx", "--name", name,
+        ];
+        if let Some(folder) = folder_token {
+            args.push("--folder-token");
+            args.push(folder);
+        }
+        let result = self.run_cli_in_dir(&args, &tmp_dir).await;
 
         let _ = std::fs::remove_file(&tmp_file);
         result
@@ -467,13 +573,21 @@ impl ProviderAuth for CliProvider {
     }
 }
 
-#[async_trait::async_trait]
-impl DocProvider for CliProvider {
-    async fn create(&self, name: &str, content: &str) -> Result<DocMeta, LarkNotesError> {
+impl CliProvider {
+    /// Create a document, optionally inside a specific drive folder.
+    /// `folder_token = None` puts it at the user's drive root (legacy behavior).
+    pub async fn create_in_folder(
+        &self,
+        name: &str,
+        content: &str,
+        folder_token: Option<&str>,
+    ) -> Result<DocMeta, LarkNotesError> {
+        let content = math::push_math_to_equation(content);
+        let content = content.as_str();
         if content.len() > MAX_CLI_ARG_LEN {
             // Large content: use drive +import (has built-in polling, unlike
             // docs +create which returns an async MCP task for large content).
-            let json = self.import_markdown(name, content).await?;
+            let json = self.import_markdown(name, content, folder_token).await?;
             let token = json.pointer("/data/token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
@@ -507,17 +621,27 @@ impl DocProvider for CliProvider {
                 desired_path: None,
             });
         }
-        let json = self
-            .run_cli(&["docs", "+create", "--title", name, "--markdown", content])
-            .await?;
+        let mut args: Vec<&str> = vec!["docs", "+create", "--title", name, "--markdown", content];
+        if let Some(folder) = folder_token {
+            args.push("--folder-token");
+            args.push(folder);
+        }
+        let json = self.run_cli(&args).await?;
         parse_create_response(&json, name)
+    }
+}
+
+#[async_trait::async_trait]
+impl DocProvider for CliProvider {
+    async fn create(&self, name: &str, content: &str) -> Result<DocMeta, LarkNotesError> {
+        self.create_in_folder(name, content, None).await
     }
 
     async fn read(&self, id: &str) -> Result<ReadOutput, LarkNotesError> {
         let json = self
             .run_cli(&["docs", "+fetch", "--doc", id, "--format", "json"])
             .await?;
-        let content = parse_fetch_response(&json);
+        let content = math::pull_equation_to_math(&parse_fetch_response(&json));
         // Extract available metadata from the fetch response
         let title_raw = json.pointer("/data/title")
             .and_then(|v| v.as_str())
@@ -562,6 +686,8 @@ impl DocProvider for CliProvider {
     }
 
     async fn write(&self, id: &str, content: &str) -> Result<WriteMeta, LarkNotesError> {
+        let content = math::push_math_to_equation(content);
+        let content = content.as_str();
         if content.len() > MAX_CLI_ARG_LEN {
             // Large content: docs +update returns an async MCP task that lark-cli
             // doesn't poll, so use delete + drive +import instead.
@@ -570,7 +696,7 @@ impl DocProvider for CliProvider {
                 Err(_) => String::new(),
             };
             let _ = self.delete(id).await; // best-effort delete
-            let json = self.import_markdown(&title, content).await?;
+            let json = self.import_markdown(&title, content, None).await?;
             let new_token = json.pointer("/data/token")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
@@ -610,13 +736,16 @@ impl DocProvider for CliProvider {
     }
 
     async fn rename(&self, id: &str, new_name: &str) -> Result<(), LarkNotesError> {
-        // Use append mode with a single space — harmless in Markdown, avoids
-        // reading + re-uploading the entire document just to change the title.
+        // Use Drive files.patch to rename the file in Drive — this updates the
+        // name shown in the sidebar/breadcrumb, not just the in-document title.
+        let data = serde_json::json!({ "new_title": new_name }).to_string();
         self.run_cli(&[
-            "docs", "+update", "--doc", id,
-            "--mode", "append",
-            "--new-title", new_name,
-            "--markdown", " ",
+            "drive", "files", "patch",
+            "--params", &serde_json::json!({
+                "file_token": id,
+                "type": "docx"
+            }).to_string(),
+            "--data", &data,
         ]).await?;
         Ok(())
     }
@@ -635,6 +764,80 @@ impl DocProvider for CliProvider {
             .run_cli(&["docs", "+search", "--query", query, "--format", "json"])
             .await?;
         Ok(parse_search_results(&json))
+    }
+
+    async fn query_metas(
+        &self,
+        remote_ids: &[String],
+    ) -> Result<BatchMetas, LarkNotesError> {
+        // Lark caps batch_query at 200 docs per request.
+        const BATCH: usize = 200;
+        let mut out = BatchMetas {
+            found: Vec::with_capacity(remote_ids.len()),
+            gone: Vec::new(),
+        };
+        for chunk in remote_ids.chunks(BATCH) {
+            let request_docs: Vec<serde_json::Value> = chunk
+                .iter()
+                .map(|t| serde_json::json!({ "doc_token": t, "doc_type": "docx" }))
+                .collect();
+            let body = serde_json::json!({ "request_docs": request_docs }).to_string();
+            let json = self
+                .run_cli(&[
+                    "drive", "metas", "batch_query",
+                    "--data", &body,
+                ])
+                .await?;
+            let metas = json
+                .pointer("/data/metas")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for m in metas {
+                let token = m.get("doc_token").and_then(|v| v.as_str()).unwrap_or("");
+                if token.is_empty() { continue; }
+                // latest_modify_time is a string-encoded Unix seconds int.
+                let modify_time = m
+                    .get("latest_modify_time")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let modify_user = m
+                    .get("latest_modify_user")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                out.found.push(RemoteMeta {
+                    remote_id: token.to_string(),
+                    modify_time,
+                    modify_user,
+                });
+            }
+            // Surface per-doc failures: 970005 = file not found (deleted),
+            // 970003 = permission revoked. Both mean the user can no longer
+            // see the doc; treat as "remote gone". 970002 (type mismatch)
+            // is a programming error — log and skip.
+            let failed = json
+                .pointer("/data/failed_list")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for f in failed {
+                let token = f.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                if token.is_empty() { continue; }
+                let code = f
+                    .get("code")
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .unwrap_or(0);
+                match code {
+                    970005 | 970003 => out.gone.push(token.to_string()),
+                    other => tracing::warn!(
+                        "query_metas: unexpected failed code {other} for {token}"
+                    ),
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -666,6 +869,10 @@ mod tests {
         let status = parse_auth_status(&json);
         assert!(status.logged_in);
         assert_eq!(status.user_name.as_deref(), Some("李新锐"));
+        assert_eq!(
+            status.user_open_id.as_deref(),
+            Some("ou_507c656d960a2b496a0a63d436bb205e")
+        );
         assert_eq!(status.expires_at.as_deref(), Some("2026-04-02T21:10:54+08:00"));
         assert!(!status.needs_refresh);
     }
@@ -898,6 +1105,90 @@ mod tests {
         assert_eq!(unescape_markdown(input), expected);
     }
 
+    // ========== lark_tables_to_markdown tests ===========
+
+    #[test]
+    fn test_lark_table_with_header() {
+        let input = r#"Before
+
+<lark-table rows="3" cols="2" header-row="true" column-widths="100,100">
+
+  <lark-tr>
+    <lark-td>
+      Name
+    </lark-td>
+    <lark-td>
+      Value
+    </lark-td>
+  </lark-tr>
+  <lark-tr>
+    <lark-td>
+      alpha
+    </lark-td>
+    <lark-td>
+      1
+    </lark-td>
+  </lark-tr>
+  <lark-tr>
+    <lark-td>
+      beta
+    </lark-td>
+    <lark-td>
+      2
+    </lark-td>
+  </lark-tr>
+
+</lark-table>
+
+After"#;
+        let result = lark_tables_to_markdown(input);
+        assert!(result.starts_with("Before\n\n"));
+        assert!(result.contains("| Name  | Value |"));
+        assert!(result.contains("| ----- | ----- |"));
+        assert!(result.contains("| alpha | 1     |"));
+        assert!(result.contains("| beta  | 2     |"));
+        assert!(result.ends_with("After"));
+        // No lark-table tags remain
+        assert!(!result.contains("<lark-t"));
+    }
+
+    #[test]
+    fn test_lark_table_no_header() {
+        let input = r#"<lark-table rows="2" cols="2" column-widths="100,100">
+
+  <lark-tr>
+    <lark-td>
+      a
+    </lark-td>
+    <lark-td>
+      b
+    </lark-td>
+  </lark-tr>
+  <lark-tr>
+    <lark-td>
+      c
+    </lark-td>
+    <lark-td>
+      d
+    </lark-td>
+  </lark-tr>
+
+</lark-table>"#;
+        let result = lark_tables_to_markdown(input);
+        // No separator row when header-row is absent
+        assert!(result.contains("| a"));
+        assert!(result.contains("| b"));
+        assert!(result.contains("| c"));
+        assert!(result.contains("| d"));
+        assert!(!result.contains("---"));
+    }
+
+    #[test]
+    fn test_no_lark_tables() {
+        let input = "Just regular markdown\n\n| a | b |\n| - | - |";
+        assert_eq!(lark_tables_to_markdown(input), input);
+    }
+
     // ========== parse edge cases ===========
 
     #[test]
@@ -990,7 +1281,7 @@ mod tests {
         // Create
         let title = format!("TestDoc-{}", chrono::Local::now().format("%H%M%S"));
         let markdown = format!("# {title}\n\nCreated by integration test.");
-        let meta = provider.create(&title, &markdown).await.unwrap();
+        let meta = live_create(&provider, &title, &markdown).await.unwrap();
         let rid = meta.remote_id.as_deref().unwrap();
         assert!(!rid.is_empty(), "remote_id should not be empty");
         assert!(meta.url.contains(rid), "url should contain remote_id");
@@ -1156,6 +1447,18 @@ mod tests {
         format!("_Test_{label}_{}", chrono::Local::now().format("%H%M%S%3f"))
     }
 
+    /// Create a doc inside the dedicated test folder, so leaks don't pollute
+    /// the user's drive root. Use this in place of `provider.create(...)` in
+    /// every live test that creates a remote document.
+    async fn live_create(
+        p: &CliProvider,
+        name: &str,
+        content: &str,
+    ) -> Result<DocMeta, LarkNotesError> {
+        let folder = crate::test_support::test_folder_token().await;
+        p.create_in_folder(name, content, Some(&folder)).await
+    }
+
     // #1: CREATE OK
     #[tokio::test]
     #[ignore]
@@ -1163,11 +1466,133 @@ mod tests {
         let p = live_provider();
         let title = test_title("create_ok");
         let md = format!("# {title}\n\nCreated by integration test.");
-        let meta = p.create(&title, &md).await.unwrap();
+        let meta = live_create(&p, &title, &md).await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
         assert!(!rid.is_empty(), "remote_id should not be empty");
         assert!(!meta.url.is_empty(), "url should not be empty");
         // Cleanup
+        let _ = p.delete(&rid).await;
+    }
+
+    // ── Smoke tests for the new metas / math-roundtrip stack ──────────
+
+    // Baseline must not drift on a no-op re-query: this is the property
+    // that prevents the post-push ping-pong.
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_metas_baseline_stable() {
+        let p = live_provider();
+        let title = test_title("metas_stable");
+        let md = format!("# {title}\n\nbaseline test");
+        let meta = live_create(&p, &title, &md).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let m1 = p.query_metas(&[rid.clone()]).await.unwrap();
+        assert_eq!(m1.found.len(), 1, "metas missing for {rid}");
+        assert!(m1.gone.is_empty(), "live doc reported gone");
+        let (t1, u1) = (m1.found[0].modify_time, m1.found[0].modify_user.clone());
+        assert!(t1 > 0, "modify_time should be set");
+        assert!(!u1.is_empty(), "modify_user should be set");
+
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let m2 = p.query_metas(&[rid.clone()]).await.unwrap();
+        assert_eq!(m2.found[0].modify_time, t1, "modify_time drifted on no-op");
+        assert_eq!(m2.found[0].modify_user, u1, "modify_user changed on no-op");
+
+        let _ = p.delete(&rid).await;
+    }
+
+    // After a real write, modify_time must advance — this is the property
+    // that lets the poll loop detect remote-side edits.
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_metas_baseline_advances_on_write() {
+        let p = live_provider();
+        let title = test_title("metas_advance");
+        let md = format!("# {title}\n\noriginal");
+        let meta = live_create(&p, &title, &md).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let t1 = p.query_metas(&[rid.clone()]).await.unwrap().found[0].modify_time;
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let updated = format!("# {title}\n\nupdated by smoke test");
+        p.write(&rid, &updated).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let t2 = p.query_metas(&[rid.clone()]).await.unwrap().found[0].modify_time;
+        assert!(t2 > t1, "modify_time should advance: {t1} → {t2}");
+
+        let _ = p.delete(&rid).await;
+    }
+
+    // After deleting a doc on Lark, `provider.read()` must return a
+    // not-found error. This is the signal the scheduler uses to mark the
+    // local note RemoteDeleted; without it the doc would silently keep
+    // its "Synced" status forever.
+    //
+    // Note: Lark's `metas batch_query` does NOT surface soft-deletes —
+    // it still returns the trashed doc as if alive — so we cannot rely
+    // on `BatchMetas.gone` being populated for `+delete`-deleted docs.
+    // The `gone` field is kept for future hard-delete / 970005 handling.
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_read_returns_not_found_after_delete() {
+        let p = live_provider();
+        let title = test_title("read_after_delete");
+        let md = format!("# {title}\n\nwill be deleted");
+        let meta = live_create(&p, &title, &md).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
+
+        // Sanity: read works while alive.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        p.read(&rid).await.expect("read should succeed before delete");
+
+        // Delete, then read again.
+        p.delete(&rid).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        match p.read(&rid).await {
+            Err(e) => assert!(
+                e.is_not_found(),
+                "expected not_found error after delete, got: {e}"
+            ),
+            Ok(_) => panic!("read should fail after delete"),
+        }
+    }
+
+    // The exact corruption case the user reported: two adjacent inline
+    // math expressions with `_{...}` subscripts must survive a roundtrip.
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_math_roundtrip_preserved() {
+        let p = live_provider();
+        let title = test_title("math_roundtrip");
+        let body = r"两部分 $\mathcal{C}_{pre}$ 与 $\mathcal{C}_{post}$";
+        let md = format!("# {title}\n\n{body}");
+        let meta = live_create(&p, &title, &md).await.unwrap();
+        let rid = meta.remote_id.clone().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let read = p.read(&rid).await.unwrap();
+        assert!(
+            read.content.contains(r"$\mathcal{C}_{pre}$"),
+            "pre subscript missing; got: {}",
+            read.content
+        );
+        assert!(
+            read.content.contains(r"$\mathcal{C}_{post}$"),
+            "post subscript missing; got: {}",
+            read.content
+        );
+        assert!(
+            !read.content.contains("*{pre}"),
+            "italic-corruption marker present; got: {}",
+            read.content
+        );
+
         let _ = p.delete(&rid).await;
     }
 
@@ -1190,7 +1615,7 @@ mod tests {
         let p = live_provider();
         let title = test_title("pull_s1");
         let md = format!("# {title}\n\nPull S1 test content.");
-        let meta = p.create(&title, &md).await.unwrap();
+        let meta = live_create(&p, &title, &md).await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
 
         // Wait briefly for Feishu to index
@@ -1210,7 +1635,7 @@ mod tests {
         let p = live_provider();
         let title = test_title("pull_s2");
         let md = format!("# {title}\n\nOriginal remote content.");
-        let meta = p.create(&title, &md).await.unwrap();
+        let meta = live_create(&p, &title, &md).await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1232,7 +1657,7 @@ mod tests {
         // Currently indistinguishable from S1 without remote_hash comparison.
         let p = live_provider();
         let title = test_title("pull_s3");
-        let meta = p.create(&title, "# S3 test").await.unwrap();
+        let meta = live_create(&p, &title, "# S3 test").await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
         let fetched = p.read(&rid).await.unwrap();
         assert!(fetched.content.is_empty() || !fetched.content.is_empty(), "Just verify call succeeds");
@@ -1245,7 +1670,7 @@ mod tests {
     async fn test_live_pull_s4_overwrite() {
         let p = live_provider();
         let title = test_title("pull_s4");
-        let meta = p.create(&title, "# S4 test").await.unwrap();
+        let meta = live_create(&p, &title, "# S4 test").await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
         let fetched = p.read(&rid).await.unwrap();
         assert!(fetched.content.is_empty() || !fetched.content.is_empty(), "Just verify call succeeds");
@@ -1269,7 +1694,7 @@ mod tests {
         let p = live_provider();
         let title = test_title("pull_s6_import");
         let md = format!("# {title}\n\nImport test.");
-        let meta = p.create(&title, &md).await.unwrap();
+        let meta = live_create(&p, &title, &md).await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1293,7 +1718,7 @@ mod tests {
     async fn test_live_delete_s1_ok() {
         let p = live_provider();
         let title = test_title("del_s1");
-        let meta = p.create(&title, "# Delete S1").await.unwrap();
+        let meta = live_create(&p, &title, "# Delete S1").await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
 
         p.delete(&rid).await.unwrap();
@@ -1311,7 +1736,7 @@ mod tests {
     async fn test_live_delete_s2_ok() {
         let p = live_provider();
         let title = test_title("del_s2");
-        let meta = p.create(&title, "# Delete S2 original").await.unwrap();
+        let meta = live_create(&p, &title, "# Delete S2 original").await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
 
         // Update remote (simulates having local changes pushed)
@@ -1327,7 +1752,7 @@ mod tests {
     async fn test_live_delete_s3_ok() {
         let p = live_provider();
         let title = test_title("del_s3");
-        let meta = p.create(&title, "# Delete S3").await.unwrap();
+        let meta = live_create(&p, &title, "# Delete S3").await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
         p.delete(&rid).await.unwrap();
     }
@@ -1338,7 +1763,7 @@ mod tests {
     async fn test_live_delete_s4_ok() {
         let p = live_provider();
         let title = test_title("del_s4");
-        let meta = p.create(&title, "# Delete S4").await.unwrap();
+        let meta = live_create(&p, &title, "# Delete S4").await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
         p.delete(&rid).await.unwrap();
     }
@@ -1349,7 +1774,7 @@ mod tests {
     async fn test_live_delete_s5_local_only() {
         let p = live_provider();
         let title = test_title("del_s5");
-        let meta = p.create(&title, "# Delete S5").await.unwrap();
+        let meta = live_create(&p, &title, "# Delete S5").await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
         p.delete(&rid).await.unwrap();
 
@@ -1432,7 +1857,7 @@ mod tests {
         let p = live_provider();
         let title = test_title("write_ok");
         let md = format!("# {title}\n\nOriginal.");
-        let meta = p.create(&title, &md).await.unwrap();
+        let meta = live_create(&p, &title, &md).await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1467,7 +1892,7 @@ mod tests {
         let p = live_provider();
         let title = test_title("rename_ok");
         let md = format!("# {title}\n\nRename test.");
-        let meta = p.create(&title, &md).await.unwrap();
+        let meta = live_create(&p, &title, &md).await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1503,7 +1928,7 @@ mod tests {
         let p = live_provider();
         let title = test_title("rename_special");
         let md = format!("# {title}\n\nSpecial char rename test.");
-        let meta = p.create(&title, &md).await.unwrap();
+        let meta = live_create(&p, &title, &md).await.unwrap();
         let rid = meta.remote_id.clone().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;

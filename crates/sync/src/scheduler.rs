@@ -372,48 +372,163 @@ impl Scheduler {
             return;
         }
 
-        tracing::debug!("poll: checking {} docs", docs.len());
-
         // Scan filesystem
         let scan_result = scanner::scan(&self.workspace_dir, &self.storage);
 
-        // Poll remote for each synced doc that has a remote_id
-        let mut remote_observations = Vec::new();
-        for doc in &docs {
-            match &doc.sync_state {
-                SyncState::Executing | SyncState::Conflict | SyncState::PendingDelete | SyncState::PendingCreate => continue,
-                _ => {}
-            }
+        // Filter to docs eligible for remote polling.
+        let eligible: Vec<&DocMeta> = docs
+            .iter()
+            .filter(|d| {
+                !matches!(
+                    d.sync_state,
+                    SyncState::Executing
+                        | SyncState::Conflict
+                        | SyncState::PendingDelete
+                        | SyncState::PendingCreate
+                )
+            })
+            .filter(|d| d.remote_id.as_deref().is_some_and(|s| !s.is_empty()))
+            .collect();
 
-            let remote_id = match &doc.remote_id {
-                Some(id) => id.clone(),
-                None => continue,
+        let remote_ids: Vec<String> = eligible
+            .iter()
+            .map(|d| d.remote_id.clone().unwrap())
+            .collect();
+
+        if remote_ids.is_empty() {
+            return;
+        }
+
+        tracing::debug!("poll: querying metas for {} docs", remote_ids.len());
+
+        // Single batch metas query — Lark's authoritative change indicator.
+        // Far cheaper than one content fetch per doc, and not affected by
+        // server-side markdown normalisation.
+        let metas = match self.provider.query_metas(&remote_ids).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("poll: query_metas failed: {e}");
+                return;
+            }
+        };
+        let meta_by_id: HashMap<String, &RemoteMeta> = metas
+            .found
+            .iter()
+            .map(|m| (m.remote_id.clone(), m))
+            .collect();
+        let gone: HashSet<&str> = metas.gone.iter().map(String::as_str).collect();
+
+        // Mark notes whose remote doc is gone (deleted or permission revoked).
+        // The local file is preserved; the user decides via UI whether to
+        // recreate on remote, delete locally, or restore from snapshot.
+        if !gone.is_empty() {
+            let to_mark: Vec<String> = eligible
+                .iter()
+                .filter(|d| {
+                    d.remote_id
+                        .as_deref()
+                        .is_some_and(|id| gone.contains(id))
+                })
+                .map(|d| d.note_id.clone())
+                .collect();
+            if !to_mark.is_empty() {
+                if let Ok(store) = self.storage.lock() {
+                    for note_id in &to_mark {
+                        let _ = store.update_sync_status(note_id, &SyncStatus::RemoteDeleted);
+                    }
+                }
+                tracing::warn!("poll: {} doc(s) gone from remote: {:?}", to_mark.len(), to_mark);
+            }
+        }
+
+        // Decide per-doc: skip, adopt-baseline-only, or fetch + observe.
+        let mut to_fetch: Vec<(String, String, i64, String)> = Vec::new();
+        for doc in &eligible {
+            let remote_id = doc.remote_id.clone().unwrap();
+            if gone.contains(remote_id.as_str()) {
+                // Already handled above.
+                continue;
+            }
+            let Some(meta) = meta_by_id.get(&remote_id) else {
+                // Token requested but neither in `found` nor `gone` — Lark
+                // returned no info at all. Likely transient; try again next
+                // poll cycle.
+                tracing::debug!("poll: no meta for {remote_id}, retrying next cycle");
+                continue;
             };
 
+            // Recovery: a doc previously flagged RemoteDeleted that now
+            // appears in `found` is back (permission restored, undeleted).
+            // Clear the status so the user no longer sees the alert.
+            if doc.sync_status == SyncStatus::RemoteDeleted {
+                if let Ok(store) = self.storage.lock() {
+                    let _ = store.update_sync_status(&doc.note_id, &SyncStatus::Synced);
+                }
+            }
+
+            let stored = self
+                .storage
+                .lock()
+                .ok()
+                .and_then(|s| s.get_remote_modify_baseline(&doc.note_id).ok().flatten());
+
+            match stored {
+                Some((t, ref u))
+                    if t == meta.modify_time && u == &meta.modify_user =>
+                {
+                    // Unchanged since last baseline — common case, no I/O.
+                    continue;
+                }
+                None => {
+                    // No baseline yet (fresh DB / migrated row). Adopt the
+                    // current state as baseline without pulling — the user's
+                    // local file is the truth they just opened the app with.
+                    if let Ok(store) = self.storage.lock() {
+                        let _ = store.set_remote_modify_baseline(
+                            &doc.note_id,
+                            meta.modify_time,
+                            &meta.modify_user,
+                        );
+                    }
+                    continue;
+                }
+                Some(_) => {
+                    // Baseline exists and differs — genuine remote change.
+                    to_fetch.push((
+                        doc.note_id.clone(),
+                        remote_id,
+                        meta.modify_time,
+                        meta.modify_user.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Fetch content only for docs that actually changed.
+        let mut remote_observations = Vec::new();
+        for (note_id, remote_id, modify_time, modify_user) in to_fetch {
             let _permit = match self.semaphore.acquire().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
-
-            let cached_remote_hash = self.storage.lock().ok()
-                .and_then(|s| s.get_remote_hash(&doc.note_id).ok().flatten());
-
-            // Read remote content
             match self.provider.read(&remote_id).await {
                 Ok(read_output) => {
-                    let remote_hash = hash_content(read_output.content.as_bytes());
-                    // Only report as observation if hash differs from stored baseline
-                    if cached_remote_hash.as_deref() != Some(&remote_hash) {
-                        remote_observations.push(planner::RemoteObservation {
-                            note_id: doc.note_id.clone(),
-                            remote_hash,
-                            remote_content: read_output.content,
-                        });
-                    }
+                    remote_observations.push(planner::RemoteObservation {
+                        note_id,
+                        remote_content: read_output.content,
+                        modify_time,
+                        modify_user,
+                    });
                 }
                 Err(e) => {
                     if e.is_not_found() {
-                        tracing::warn!("poll: remote doc not found: {} (remote={remote_id})", doc.note_id);
+                        // Lark's `metas` doesn't surface soft-deletes; `read`
+                        // is the only signal we get. Flag the local note so
+                        // the user can decide (recreate vs. delete locally).
+                        tracing::warn!("poll: remote doc deleted: {note_id} (remote={remote_id})");
+                        if let Ok(store) = self.storage.lock() {
+                            let _ = store.update_sync_status(&note_id, &SyncStatus::RemoteDeleted);
+                        }
                     } else {
                         tracing::debug!("poll: failed to read remote {remote_id}: {e}");
                     }

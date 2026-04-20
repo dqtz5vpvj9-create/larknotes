@@ -1102,6 +1102,12 @@ mod tests {
         async fn search(&self, _query: &str) -> Result<Vec<DocMeta>, LarkNotesError> {
             Ok(vec![])
         }
+        async fn query_metas(
+            &self,
+            _ids: &[String],
+        ) -> Result<BatchMetas, LarkNotesError> {
+            Ok(BatchMetas::default())
+        }
     }
 
     #[async_trait::async_trait]
@@ -1110,6 +1116,7 @@ mod tests {
             Ok(AuthStatus {
                 logged_in: true,
                 user_name: Some("MockUser".to_string()),
+                user_open_id: Some("ou_mock".to_string()),
                 needs_refresh: false,
                 expires_at: None,
             })

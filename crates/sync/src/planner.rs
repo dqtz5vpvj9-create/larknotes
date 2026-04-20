@@ -16,10 +16,14 @@ pub enum SyncAction {
         title: String,
         local_hash: String,
     },
-    /// Pull remote content to local file.
+    /// Pull remote content to local file. Carries the observed Lark
+    /// `latest_modify_time` / `latest_modify_user` so the executor can
+    /// persist the new baseline atomically with the local write.
     Pull {
         note_id: String,
         remote_content: String,
+        modify_time: i64,
+        modify_user: String,
     },
     /// Create a new remote document for a local-only note.
     CreateRemote {
@@ -62,11 +66,18 @@ pub enum SyncAction {
 }
 
 /// Remote observation: what we observed from polling the remote for a note.
+///
+/// Scheduler emits one of these only when Lark's `latest_modify_time` /
+/// `latest_modify_user` for a tracked doc differs from the stored baseline,
+/// so presence in the observation list already means "remote changed since
+/// our last sync". `modify_time` and `modify_user` are passed through so the
+/// executor can persist the new baseline after a successful pull.
 #[derive(Debug, Clone)]
 pub struct RemoteObservation {
     pub note_id: String,
-    pub remote_hash: String,
     pub remote_content: String,
+    pub modify_time: i64,
+    pub modify_user: String,
 }
 
 // ─── Planner ────────────────────────────────────────────
@@ -110,14 +121,11 @@ pub fn plan(
             _ => {}
         }
 
-        // Check if remote also changed
+        // Check if remote also changed. Scheduler only emits an observation
+        // when (modify_time, modify_user) diverges from the stored baseline,
+        // so presence already means "remote changed".
         let remote_obs = remote_by_note.get(note_id.as_str());
-        let remote_changed = remote_obs.is_some_and(|obs| {
-            // Compare remote observed hash against stored remote baseline.
-            // Scheduler only includes observations where hash already differs
-            // from stored remote_base_hash, so presence means "changed".
-            !obs.remote_hash.is_empty()
-        });
+        let remote_changed = remote_obs.is_some();
 
         let has_base = note.content_hash.is_some();
         let local_changed = *change_kind == ChangeKind::ContentChanged;
@@ -142,6 +150,8 @@ pub fn plan(
                         actions.push(SyncAction::Pull {
                             note_id: note_id.clone(),
                             remote_content: obs.remote_content.clone(),
+                            modify_time: obs.modify_time,
+                            modify_user: obs.modify_user.clone(),
                         });
                     }
                 }
@@ -202,6 +212,8 @@ pub fn plan(
         actions.push(SyncAction::Pull {
             note_id: obs.note_id.clone(),
             remote_content: obs.remote_content.clone(),
+            modify_time: obs.modify_time,
+            modify_user: obs.modify_user.clone(),
         });
     }
 
@@ -362,8 +374,9 @@ mod tests {
         let notes = vec![make_note("n1", "Note1", Some("abc"), SyncState::Synced)];
         let remote = vec![RemoteObservation {
             note_id: "n1".to_string(),
-            remote_hash: "new_remote_hash".to_string(),
             remote_content: "# Updated remotely".to_string(),
+            modify_time: 1_700_000_000,
+            modify_user: "ou_other".to_string(),
         }];
         let actions = plan(&scan, &notes, &remote);
 
@@ -379,8 +392,9 @@ mod tests {
         let notes = vec![make_note("n1", "Note1", Some("abc"), SyncState::Synced)];
         let remote = vec![RemoteObservation {
             note_id: "n1".to_string(),
-            remote_hash: "changed_remote".to_string(),
             remote_content: "# Remote content".to_string(),
+            modify_time: 1_700_000_000,
+            modify_user: "ou_other".to_string(),
         }];
         let actions = plan(&scan, &notes, &remote);
 

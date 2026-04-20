@@ -13,7 +13,11 @@
       "Bash(cargo doc:*)",
       "Bash(cargo test:*)",
       "Bash(taskkill //PID 38000 //F)",
-      "Bash(taskkill //IM notepad.exe //F)"
+      "Bash(taskkill //IM notepad.exe //F)",
+      "Bash(ssh win:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(git push:*)"
     ]
   },
   "enabledPlugins": {

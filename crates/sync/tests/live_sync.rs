@@ -2,6 +2,7 @@
 //! Run with: cargo test -p larknotes-sync -- --ignored
 
 use larknotes_core::*;
+use larknotes_provider_cli::test_support::test_folder_token;
 use larknotes_provider_cli::CliProvider;
 use larknotes_storage::Storage;
 use larknotes_sync::{hash_content};
@@ -15,6 +16,17 @@ fn live_provider() -> Arc<CliProvider> {
 
 fn test_title(label: &str) -> String {
     format!("_Test_{label}_{}", chrono::Local::now().format("%H%M%S%3f"))
+}
+
+/// Create a doc inside the dedicated test folder (mirrors the helper in
+/// crates/provider-cli). Use this in place of `provider.create(...)`.
+async fn live_create(
+    provider: &CliProvider,
+    title: &str,
+    content: &str,
+) -> Result<DocMeta, LarkNotesError> {
+    let folder = test_folder_token().await;
+    provider.create_in_folder(title, content, Some(&folder)).await
 }
 
 fn setup_workspace() -> (tempfile::TempDir, Arc<Mutex<Storage>>) {
@@ -35,7 +47,7 @@ async fn create_synced_doc(
     store_matching_hash: bool,
 ) -> (String, String, std::path::PathBuf) {
     // Create on remote
-    let meta = provider.create(title, content).await.unwrap();
+    let meta = live_create(provider, title, content).await.unwrap();
     let remote_id = meta.remote_id.clone().unwrap_or_default();
     let note_id = new_note_id();
 
@@ -285,7 +297,7 @@ async fn test_live_list_through_provider() {
     let title = test_title("list_test");
     let md = format!("# {title}\n\nList test doc.");
 
-    let meta = provider.create(&title, &md).await.unwrap();
+    let meta = live_create(&provider, &title, &md).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     // List should return at least one doc

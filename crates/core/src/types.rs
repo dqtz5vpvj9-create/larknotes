@@ -97,6 +97,10 @@ pub enum SyncStatus {
     Syncing,
     Pulling,
     Conflict,
+    /// Lark reports the doc no longer exists or is no longer accessible
+    /// (file deleted, or sharing permission revoked). The local file is
+    /// kept; the user decides whether to recreate or delete locally.
+    RemoteDeleted,
     Error(String),
     #[default]
     New,
@@ -136,6 +140,9 @@ impl std::fmt::Display for SyncState {
 pub struct AuthStatus {
     pub logged_in: bool,
     pub user_name: Option<String>,
+    /// Lark `open_id` for the authenticated user. Used by sync to identify
+    /// which baseline updates are self-attributed vs. another collaborator.
+    pub user_open_id: Option<String>,
     pub expires_at: Option<String>,
     pub needs_refresh: bool,
 }

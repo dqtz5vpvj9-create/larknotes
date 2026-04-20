@@ -44,14 +44,45 @@ impl Executor {
         }
     }
 
+    /// Pin the remote-change baseline to Lark's authoritative
+    /// `latest_modify_time` / `latest_modify_user` after a successful
+    /// push or create. Without this, the next poll would observe the
+    /// post-write timestamp as "different from baseline" and trigger a
+    /// spurious pull that overwrites the user's local file with Lark's
+    /// canonicalised version.
+    async fn refresh_modify_baseline(&self, note_id: &str, remote_id: &str) {
+        let metas = match self
+            .provider
+            .query_metas(&[remote_id.to_string()])
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!("refresh_modify_baseline: query_metas failed: {e}");
+                return;
+            }
+        };
+        let Some(meta) = metas.found.into_iter().find(|m| m.remote_id == remote_id) else {
+            tracing::debug!("refresh_modify_baseline: meta missing for {remote_id}");
+            return;
+        };
+        if let Ok(store) = self.storage.lock() {
+            let _ = store.set_remote_modify_baseline(
+                note_id,
+                meta.modify_time,
+                &meta.modify_user,
+            );
+        }
+    }
+
     /// Execute a single SyncAction.
     pub async fn execute(&self, action: SyncAction) {
         match action {
             SyncAction::Push { note_id, content, title, local_hash } => {
                 self.execute_push(&note_id, &content, &title, &local_hash).await;
             }
-            SyncAction::Pull { note_id, remote_content } => {
-                self.execute_pull(&note_id, &remote_content).await;
+            SyncAction::Pull { note_id, remote_content, modify_time, modify_user } => {
+                self.execute_pull(&note_id, &remote_content, modify_time, &modify_user).await;
             }
             SyncAction::CreateRemote { note_id, content, title } => {
                 self.execute_create_remote(&note_id, &content, &title).await;
@@ -134,12 +165,13 @@ impl Executor {
                         }
                     }
 
-                    // Use local hash as remote baseline — we just wrote this content.
-                    // Skips an extra fetch round-trip. Lark's markdown export may
-                    // differ slightly from what we uploaded, but the next pull cycle
-                    // will reconcile if needed.
+                    // Persist Lark's `latest_modify_time` / `latest_modify_user`
+                    // as the remote-change baseline. Comparing content hashes
+                    // here would falsely re-trigger sync because Lark normalises
+                    // markdown server-side; the meta query is the authoritative
+                    // change indicator.
                     if let Ok(store) = self.storage.lock() {
-                        let _ = store.set_baselines(note_id, local_hash, local_hash);
+                        let _ = store.set_local_baseline(note_id, local_hash);
                         let _ = store.update_sync_status(note_id, &SyncStatus::Synced);
                         let _ = store.update_sync_state(note_id, &SyncState::Synced);
                         let _ = store.add_sync_history(note_id, "push", Some(local_hash));
@@ -147,6 +179,11 @@ impl Executor {
                         let _ = store.complete_op(op_id);
                     }
                     self.emit(note_id, SyncStatus::Synced, None);
+
+                    // Best-effort: refresh the remote modify baseline so the
+                    // next poll sees "no change". Failures are non-fatal —
+                    // worst case the next poll fetches once and reconciles.
+                    self.refresh_modify_baseline(note_id, &effective_remote_id).await;
                     tracing::info!("push成功: {note_id}");
                     return;
                 }
@@ -181,7 +218,13 @@ impl Executor {
 
     // ─── Pull ───────────────────────────────────────────
 
-    async fn execute_pull(&self, note_id: &str, remote_content: &str) {
+    async fn execute_pull(
+        &self,
+        note_id: &str,
+        remote_content: &str,
+        modify_time: i64,
+        modify_user: &str,
+    ) {
         let local_path = match self.get_local_path(note_id) {
             Some(p) => p,
             None => {
@@ -210,9 +253,11 @@ impl Executor {
         }
 
         let local_hash = hash_content(remote_content.as_bytes());
-        let remote_hash = hash_content(remote_content.as_bytes());
         if let Ok(store) = self.storage.lock() {
-            let _ = store.set_baselines(note_id, &local_hash, &remote_hash);
+            // local_base_hash tracks what's now on disk. The remote-change
+            // baseline is Lark's modify_time/user, not a content hash.
+            let _ = store.set_local_baseline(note_id, &local_hash);
+            let _ = store.set_remote_modify_baseline(note_id, modify_time, modify_user);
             let _ = store.update_sync_status(note_id, &SyncStatus::Synced);
             let _ = store.update_sync_state(note_id, &SyncState::Synced);
             let _ = store.add_sync_history(note_id, "pull", Some(&local_hash));
@@ -247,13 +292,9 @@ impl Executor {
                 };
                 let local_hash = hash_content(content.as_bytes());
 
-                // Use local hash as remote baseline — we just uploaded this content,
-                // so they match. Skips an extra fetch round-trip (~2-20s).
-                let remote_hash = local_hash.clone();
-
                 if let Ok(store) = self.storage.lock() {
                     let _ = store.update_remote_id(note_id, remote_id);
-                    let _ = store.set_baselines(note_id, &local_hash, &remote_hash);
+                    let _ = store.set_local_baseline(note_id, &local_hash);
                     let _ = store.update_url(note_id, &created_meta.url);
                     let _ = store.update_sync_status(note_id, &SyncStatus::Synced);
                     let _ = store.update_sync_state(note_id, &SyncState::Synced);
@@ -262,6 +303,10 @@ impl Executor {
                     let _ = store.complete_op(op_id);
                 }
                 self.emit(note_id, SyncStatus::Synced, Some(title.to_string()));
+
+                // Same rationale as in execute_push: pin the remote baseline
+                // to Lark's modify_time/user so polls don't re-trigger.
+                self.refresh_modify_baseline(note_id, remote_id).await;
                 tracing::info!("create_remote成功: {note_id} → {remote_id}");
             }
             Err(e) => {
@@ -523,15 +568,9 @@ impl Executor {
                     }
                 };
 
-                // Read back for remote baseline
-                let remote_hash = match self.provider.read(&new_remote_id).await {
-                    Ok(read_output) => hash_content(read_output.content.as_bytes()),
-                    Err(_) => local_hash.to_string(), // fallback
-                };
-
                 if let Ok(store) = self.storage.lock() {
                     let _ = store.update_remote_id(note_id, &new_remote_id);
-                    let _ = store.set_baselines(note_id, local_hash, &remote_hash);
+                    let _ = store.set_local_baseline(note_id, local_hash);
                     let _ = store.update_url(note_id, &new_meta.url);
                     let _ = store.update_sync_status(note_id, &SyncStatus::Synced);
                     let _ = store.update_sync_state(note_id, &SyncState::Synced);
@@ -539,6 +578,7 @@ impl Executor {
                     let _ = store.save_snapshot(note_id, content, local_hash);
                 }
                 self.emit(note_id, SyncStatus::Synced, Some(title.to_string()));
+                self.refresh_modify_baseline(note_id, &new_remote_id).await;
                 tracing::info!("recreate成功: {note_id} → {new_remote_id}");
             }
             Err(e) => {
