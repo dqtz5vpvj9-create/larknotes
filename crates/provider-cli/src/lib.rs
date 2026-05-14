@@ -1,12 +1,12 @@
 use larknotes_core::*;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::RwLock;
 use tokio::process::Command;
 
-pub mod math;
 pub mod test_support;
 
 pub struct CliProvider {
@@ -208,110 +208,6 @@ fn parse_cli_output(stdout: &str) -> Result<serde_json::Value, LarkNotesError> {
     Ok(json)
 }
 
-fn unescape_markdown(s: &str) -> String {
-    s.replace("\\*", "*")
-        .replace("\\~", "~")
-        .replace("\\`", "`")
-        .replace("\\[", "[")
-        .replace("\\]", "]")
-        .replace("\\#", "#")
-        .replace("\\>", ">")
-        .replace("\\-", "-")
-        .replace("\\_", "_")
-}
-
-/// Convert `<lark-table>` HTML blocks to markdown pipe tables.
-fn lark_tables_to_markdown(s: &str) -> String {
-    use std::fmt::Write;
-
-    let mut result = String::with_capacity(s.len());
-    let mut rest = s;
-
-    while let Some(start) = rest.find("<lark-table") {
-        // Copy everything before this table
-        result.push_str(&rest[..start]);
-
-        // Find the closing tag
-        let Some(end) = rest[start..].find("</lark-table>") else {
-            // Malformed — keep the rest as-is
-            result.push_str(&rest[start..]);
-            rest = "";
-            break;
-        };
-        let table_end = start + end + "</lark-table>".len();
-        let table_html = &rest[start..table_end];
-        rest = &rest[table_end..];
-
-        // Check if the table has a header row
-        let has_header = table_html.contains("header-row=\"true\"");
-
-        // Parse rows
-        let mut rows: Vec<Vec<String>> = Vec::new();
-        let mut row_rest = table_html;
-        while let Some(tr_start) = row_rest.find("<lark-tr>") {
-            let after_tr = &row_rest[tr_start + "<lark-tr>".len()..];
-            let Some(tr_end) = after_tr.find("</lark-tr>") else { break };
-            let tr_content = &after_tr[..tr_end];
-            row_rest = &after_tr[tr_end + "</lark-tr>".len()..];
-
-            // Parse cells within this row
-            let mut cells: Vec<String> = Vec::new();
-            let mut cell_rest = tr_content;
-            while let Some(td_start) = cell_rest.find("<lark-td>") {
-                let after_td = &cell_rest[td_start + "<lark-td>".len()..];
-                let Some(td_end) = after_td.find("</lark-td>") else { break };
-                let cell_text = after_td[..td_end].trim().to_string();
-                cells.push(cell_text);
-                cell_rest = &after_td[td_end + "</lark-td>".len()..];
-            }
-            if !cells.is_empty() {
-                rows.push(cells);
-            }
-        }
-
-        if rows.is_empty() {
-            continue;
-        }
-
-        // Compute column widths for alignment
-        let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-        let mut col_widths = vec![3usize; num_cols]; // minimum "---"
-        for row in &rows {
-            for (i, cell) in row.iter().enumerate() {
-                if i < num_cols {
-                    col_widths[i] = col_widths[i].max(cell.len());
-                }
-            }
-        }
-
-        // Build markdown table
-        let mut table = String::new();
-        for (row_idx, row) in rows.iter().enumerate() {
-            let _ = write!(table, "|");
-            for col in 0..num_cols {
-                let cell = row.get(col).map(|s| s.as_str()).unwrap_or("");
-                let _ = write!(table, " {:<width$} |", cell, width = col_widths[col]);
-            }
-            let _ = writeln!(table);
-
-            // Insert separator after header row
-            if row_idx == 0 && has_header {
-                let _ = write!(table, "|");
-                for col in 0..num_cols {
-                    let _ = write!(table, " {:-<width$} |", "", width = col_widths[col]);
-                }
-                let _ = writeln!(table);
-            }
-        }
-
-        result.push_str(table.trim_end());
-        result.push('\n');
-    }
-
-    result.push_str(rest);
-    result
-}
-
 /// Parse auth status from CLI JSON output.
 pub fn parse_auth_status(json: &serde_json::Value) -> AuthStatus {
     let token_status = json
@@ -404,17 +300,22 @@ pub fn parse_search_results(json: &serde_json::Value) -> Vec<DocMeta> {
 }
 
 /// Parse create doc response from CLI JSON output.
+///
+/// Shape is the docx v2 API: `data.document.{document_id,url}`. The v1
+/// `data.{doc_id,doc_url}` shape was retired with the v2 switch — v2's
+/// markdown converter round-trips losslessly, so the v1 escaping/table
+/// workarounds (and `math.rs`) are gone.
 pub fn parse_create_response(
     json: &serde_json::Value,
     title: &str,
 ) -> Result<DocMeta, LarkNotesError> {
     let doc_id = json
-        .pointer("/data/doc_id")
+        .pointer("/data/document/document_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| LarkNotesError::Cli("返回中缺少doc_id".to_string()))?
+        .ok_or_else(|| LarkNotesError::Cli("返回中缺少document_id".to_string()))?
         .to_string();
     let url = json
-        .pointer("/data/doc_url")
+        .pointer("/data/document/url")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -445,13 +346,18 @@ pub fn parse_create_response(
     })
 }
 
-/// Parse fetch doc response — returns markdown content with unescaped syntax.
+/// Parse fetch doc response (docx v2 `+fetch --doc-format markdown`).
+///
+/// Returns `data.document.content` verbatim. v2 markdown is clean GFM —
+/// math stays as `$...$`, tables as pipe tables, nothing escaped — so
+/// there is no post-processing to do, unlike the v1 path which needed
+/// `unescape_markdown` + `lark_tables_to_markdown` + the math roundtrip
+/// hack.
 pub fn parse_fetch_response(json: &serde_json::Value) -> String {
-    let raw = json.pointer("/data/markdown")
+    json.pointer("/data/document/content")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let md = unescape_markdown(raw);
-    lark_tables_to_markdown(&md)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Max content length (in bytes) that can be safely passed as a CLI argument.
@@ -582,8 +488,16 @@ impl CliProvider {
         content: &str,
         folder_token: Option<&str>,
     ) -> Result<DocMeta, LarkNotesError> {
-        let content = math::push_math_to_equation(content);
-        let content = content.as_str();
+        // docx v2 +create derives the document title from the content's
+        // leading H1. Guarantee one so the new doc is named `name` even
+        // when the caller passes bare body text.
+        let owned;
+        let content: &str = if content.trim_start().starts_with('#') {
+            content
+        } else {
+            owned = format!("# {name}\n\n{content}");
+            &owned
+        };
         if content.len() > MAX_CLI_ARG_LEN {
             // Large content: use drive +import (has built-in polling, unlike
             // docs +create which returns an async MCP task for large content).
@@ -621,9 +535,14 @@ impl CliProvider {
                 desired_path: None,
             });
         }
-        let mut args: Vec<&str> = vec!["docs", "+create", "--title", name, "--markdown", content];
+        let mut args: Vec<&str> = vec![
+            "docs", "+create",
+            "--api-version", "v2",
+            "--doc-format", "markdown",
+            "--content", content,
+        ];
         if let Some(folder) = folder_token {
-            args.push("--folder-token");
+            args.push("--parent-token");
             args.push(folder);
         }
         let json = self.run_cli(&args).await?;
@@ -639,24 +558,20 @@ impl DocProvider for CliProvider {
 
     async fn read(&self, id: &str) -> Result<ReadOutput, LarkNotesError> {
         let json = self
-            .run_cli(&["docs", "+fetch", "--doc", id, "--format", "json"])
+            .run_cli(&[
+                "docs", "+fetch", "--doc", id,
+                "--api-version", "v2", "--doc-format", "markdown",
+            ])
             .await?;
-        let content = math::pull_equation_to_math(&parse_fetch_response(&json));
-        // Extract available metadata from the fetch response
-        let title_raw = json.pointer("/data/title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let title = if title_raw.is_empty() {
-            extract_title(&content)
-        } else {
-            title_raw.to_string()
-        };
-        let url = json.pointer("/data/doc_url")
-            .or_else(|| json.pointer("/data/url"))
+        let content = parse_fetch_response(&json);
+        // v2 +fetch returns only `document.{content,document_id,revision_id}`
+        // — no title/url field — so the title comes from the content's H1.
+        let title = extract_title(&content);
+        let url = json.pointer("/data/document/url")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let doc_id_from_resp = json.pointer("/data/doc_id")
+        let doc_id_from_resp = json.pointer("/data/document/document_id")
             .and_then(|v| v.as_str())
             .unwrap_or(id);
         // note_id left empty — caller MUST set note_id AND doc_id before DB use.
@@ -686,11 +601,12 @@ impl DocProvider for CliProvider {
     }
 
     async fn write(&self, id: &str, content: &str) -> Result<WriteMeta, LarkNotesError> {
-        let content = math::push_math_to_equation(content);
-        let content = content.as_str();
         if content.len() > MAX_CLI_ARG_LEN {
             // Large content: docs +update returns an async MCP task that lark-cli
             // doesn't poll, so use delete + drive +import instead.
+            // NOTE: this path still goes through `drive +import`, not the v2
+            // docx converter — verify it round-trips before relying on it for
+            // math-heavy >30KB docs.
             let title = match self.read(id).await {
                 Ok(ro) => ro.meta.title,
                 Err(_) => String::new(),
@@ -717,8 +633,9 @@ impl DocProvider for CliProvider {
         }
         self.run_cli(&[
             "docs", "+update", "--doc", id,
-            "--mode", "overwrite",
-            "--markdown", content,
+            "--api-version", "v2", "--doc-format", "markdown",
+            "--command", "overwrite",
+            "--content", content,
         ]).await?;
         Ok(WriteMeta {
             content_hash: String::new(),
@@ -738,6 +655,8 @@ impl DocProvider for CliProvider {
     async fn rename(&self, id: &str, new_name: &str) -> Result<(), LarkNotesError> {
         // Use Drive files.patch to rename the file in Drive — this updates the
         // name shown in the sidebar/breadcrumb, not just the in-document title.
+        // `--yes` confirms the high-risk op: lark-cli ≥ 1.0.30 rejects
+        // `drive files patch` without it ("requires confirmation").
         let data = serde_json::json!({ "new_title": new_name }).to_string();
         self.run_cli(&[
             "drive", "files", "patch",
@@ -746,6 +665,7 @@ impl DocProvider for CliProvider {
                 "type": "docx"
             }).to_string(),
             "--data", &data,
+            "--yes",
         ]).await?;
         Ok(())
     }
@@ -993,12 +913,15 @@ mod tests {
 
     #[test]
     fn test_parse_create_response_success() {
+        // docx v2 +create response shape.
         let json: serde_json::Value = serde_json::from_str(r#"{
             "ok": true,
             "data": {
-                "doc_id": "VT5rd9n3WoAVKkxkT5Kc3XyQnJh",
-                "doc_url": "https://www.feishu.cn/docx/VT5rd9n3WoAVKkxkT5Kc3XyQnJh",
-                "message": "文档创建成功"
+                "document": {
+                    "document_id": "VT5rd9n3WoAVKkxkT5Kc3XyQnJh",
+                    "revision_id": 2,
+                    "url": "https://www.feishu.cn/docx/VT5rd9n3WoAVKkxkT5Kc3XyQnJh"
+                }
             }
         }"#).unwrap();
 
@@ -1022,15 +945,16 @@ mod tests {
 
         let result = parse_create_response(&json, "Test");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("doc_id"));
+        assert!(result.unwrap_err().to_string().contains("document_id"));
     }
 
     #[test]
     fn test_parse_fetch_response_with_content() {
-        let mut data = serde_json::Map::new();
-        data.insert("markdown".to_string(), serde_json::Value::String("# Hello\n\nWorld".to_string()));
-        data.insert("title".to_string(), serde_json::Value::String("Hello".to_string()));
-        let json = serde_json::json!({ "ok": true, "data": data });
+        // docx v2 +fetch --doc-format markdown response shape.
+        let json = serde_json::json!({
+            "ok": true,
+            "data": { "document": { "content": "# Hello\n\nWorld" } }
+        });
 
         let md = parse_fetch_response(&json);
         assert_eq!(md, "# Hello\n\nWorld");
@@ -1040,7 +964,7 @@ mod tests {
     fn test_parse_fetch_response_empty_content() {
         let json: serde_json::Value = serde_json::from_str(r#"{
             "ok": true,
-            "data": { "markdown": "", "title": "Empty" }
+            "data": { "document": { "content": "" } }
         }"#).unwrap();
 
         let md = parse_fetch_response(&json);
@@ -1058,136 +982,6 @@ mod tests {
         assert_eq!(md, "");
     }
 
-    // ========== unescape_markdown tests ===========
-
-    #[test]
-    fn test_unescape_markdown_stars() {
-        assert_eq!(unescape_markdown(r"\*\*bold\*\*"), "**bold**");
-    }
-
-    #[test]
-    fn test_unescape_markdown_tilde() {
-        assert_eq!(unescape_markdown(r"\~\~strike\~\~"), "~~strike~~");
-    }
-
-    #[test]
-    fn test_unescape_markdown_backtick() {
-        assert_eq!(unescape_markdown(r"\`code\`"), "`code`");
-    }
-
-    #[test]
-    fn test_unescape_markdown_brackets() {
-        assert_eq!(unescape_markdown(r"\[link\]"), "[link]");
-    }
-
-    #[test]
-    fn test_unescape_markdown_hash() {
-        assert_eq!(unescape_markdown(r"\# Heading"), "# Heading");
-    }
-
-    #[test]
-    fn test_unescape_markdown_all_escapes() {
-        let input = r"\*\~\`\[\]\#\>\-\_";
-        let expected = "*~`[]#>-_";
-        assert_eq!(unescape_markdown(input), expected);
-    }
-
-    #[test]
-    fn test_unescape_markdown_no_escapes() {
-        assert_eq!(unescape_markdown("plain text"), "plain text");
-        assert_eq!(unescape_markdown(""), "");
-    }
-
-    #[test]
-    fn test_unescape_markdown_mixed_content() {
-        let input = r"# Hello \*\*World\*\*\n\nSome \`code\` here";
-        let expected = "# Hello **World**\\n\\nSome `code` here";
-        assert_eq!(unescape_markdown(input), expected);
-    }
-
-    // ========== lark_tables_to_markdown tests ===========
-
-    #[test]
-    fn test_lark_table_with_header() {
-        let input = r#"Before
-
-<lark-table rows="3" cols="2" header-row="true" column-widths="100,100">
-
-  <lark-tr>
-    <lark-td>
-      Name
-    </lark-td>
-    <lark-td>
-      Value
-    </lark-td>
-  </lark-tr>
-  <lark-tr>
-    <lark-td>
-      alpha
-    </lark-td>
-    <lark-td>
-      1
-    </lark-td>
-  </lark-tr>
-  <lark-tr>
-    <lark-td>
-      beta
-    </lark-td>
-    <lark-td>
-      2
-    </lark-td>
-  </lark-tr>
-
-</lark-table>
-
-After"#;
-        let result = lark_tables_to_markdown(input);
-        assert!(result.starts_with("Before\n\n"));
-        assert!(result.contains("| Name  | Value |"));
-        assert!(result.contains("| ----- | ----- |"));
-        assert!(result.contains("| alpha | 1     |"));
-        assert!(result.contains("| beta  | 2     |"));
-        assert!(result.ends_with("After"));
-        // No lark-table tags remain
-        assert!(!result.contains("<lark-t"));
-    }
-
-    #[test]
-    fn test_lark_table_no_header() {
-        let input = r#"<lark-table rows="2" cols="2" column-widths="100,100">
-
-  <lark-tr>
-    <lark-td>
-      a
-    </lark-td>
-    <lark-td>
-      b
-    </lark-td>
-  </lark-tr>
-  <lark-tr>
-    <lark-td>
-      c
-    </lark-td>
-    <lark-td>
-      d
-    </lark-td>
-  </lark-tr>
-
-</lark-table>"#;
-        let result = lark_tables_to_markdown(input);
-        // No separator row when header-row is absent
-        assert!(result.contains("| a"));
-        assert!(result.contains("| b"));
-        assert!(result.contains("| c"));
-        assert!(result.contains("| d"));
-        assert!(!result.contains("---"));
-    }
-
-    #[test]
-    fn test_no_lark_tables() {
-        let input = "Just regular markdown\n\n| a | b |\n| - | - |";
-        assert_eq!(lark_tables_to_markdown(input), input);
-    }
 
     // ========== parse edge cases ===========
 
@@ -1232,23 +1026,12 @@ After"#;
     fn test_parse_create_response_missing_url() {
         let json: serde_json::Value = serde_json::from_str(r#"{
             "ok": true,
-            "data": { "doc_id": "xyz" }
+            "data": { "document": { "document_id": "xyz" } }
         }"#).unwrap();
 
         let meta = parse_create_response(&json, "Test").unwrap();
         assert_eq!(meta.remote_id.as_deref(), Some("xyz"));
         assert_eq!(meta.url, ""); // Missing url defaults to empty
-    }
-
-    #[test]
-    fn test_parse_fetch_response_escaped_markdown() {
-        let json: serde_json::Value = serde_json::from_str(r#"{
-            "ok": true,
-            "data": { "markdown": "\\*\\*bold\\*\\*" }
-        }"#).unwrap();
-
-        let md = parse_fetch_response(&json);
-        assert_eq!(md, "**bold**"); // Should be unescaped
     }
 
     // ========== set_cli_path tests ===========
@@ -1819,7 +1602,10 @@ After"#;
     #[ignore]
     async fn test_live_search_empty() {
         let p = live_provider();
-        let results = p.search("xyzzy_nonexistent_query_12345_abcde").await.unwrap();
+        // Keep the query short — Lark's search API rejects long queries with
+        // `[99992402] field validation failed` (the limit is well under 35
+        // chars). Still gibberish, so results should be empty.
+        let results = p.search("xyzzy12345").await.unwrap();
         assert!(results.is_empty(), "Search for gibberish should return empty");
     }
 
